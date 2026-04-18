@@ -1,0 +1,7 @@
+pymongo>=4.6
+pandas>=2.1
+numpy>=1.26
+scikit-learn>=1.4
+requests>=2.31
+python-dotenv>=1.0
+tqdm>=4.66
