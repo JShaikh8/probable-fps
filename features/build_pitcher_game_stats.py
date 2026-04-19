@@ -1,117 +1,97 @@
 """
-Build per-start stats for pitchers from mlb_at_bats.
-Computes IP, K, BB, H, HR per start and season-level aggregates including FIP.
-
-Output collection: mlb_pitcher_season_stats
+Per-start pitcher stats aggregated to season level (avg IP, K, BB, H, HR, FIP).
+Writes: pitcher_season_stats.
 """
 from __future__ import annotations
-import sys
-import pandas as pd
+
 import numpy as np
-sys.path.insert(0, '..')
-from config import get_db
-from pymongo import UpdateOne
+import pandas as pd
 
-STARTER_MIN_OUTS = 9    # >= 3 IP to count as a start
-FIP_CONSTANT     = 3.10  # league-average FIP constant
+from config import get_engine, get_session
+from db.models import PitcherSeasonStats
+from db.io import bulk_upsert
 
-HIT_EVENTS = {'single', 'double', 'triple', 'home_run'}
+
+STARTER_MIN_OUTS = 9       # >= 3 IP to count as a start
+FIP_CONSTANT     = 3.10
+
+OUT_EVENTS = {
+    'strikeout', 'strikeout_double_play',
+    'field_out', 'force_out', 'grounded_into_double_play',
+    'double_play', 'triple_play', 'sac_fly', 'sac_bunt',
+    'sac_fly_double_play', 'fielders_choice_out',
+}
 
 
 def run(seasons: list[int] | None = None):
-    db = get_db()
-    season_filter = {'season': {'$in': seasons}} if seasons else {}
+    engine = get_engine()
+    where = f"WHERE season IN ({','.join(str(s) for s in seasons)})" if seasons else ''
 
-    print('Loading at-bats for pitcher stats...')
-    cur = db.mlb_at_bats.find(season_filter, {
-        '_id': 0,
-        'pitcherId': 1, 'pitcherName': 1, 'pitcherHand': 1,
-        'gamePk': 1, 'season': 1,
-        'eventType': 1, 'isOut': 1,
-    })
-    df = pd.DataFrame(list(cur))
+    print('Loading at-bats for pitcher stats…')
+    df = pd.read_sql_query(
+        f"""
+        SELECT pitcher_id, game_pk, season, event_type
+        FROM at_bats
+        {where}
+        """,
+        engine,
+    )
     if df.empty:
         print('No data.')
         return
+    print(f'  {len(df):,} at-bats')
 
-    print(f'  {len(df):,} at-bats loaded')
+    df['is_k']    = df['event_type'].isin({'strikeout', 'strikeout_double_play'})
+    df['is_bb']   = df['event_type'].isin({'walk', 'intent_walk'})
+    df['is_h']    = df['event_type'].isin({'single', 'double', 'triple', 'home_run'})
+    df['is_hr']   = df['event_type'] == 'home_run'
+    df['is_out']  = df['event_type'].isin(OUT_EVENTS)
 
-    df['isK']    = df['eventType'].isin({'strikeout', 'strikeout_double_play'})
-    df['isBB']   = df['eventType'].isin({'walk', 'intent_walk'})
-    df['isH']    = df['eventType'].isin(HIT_EVENTS)
-    df['isHR']   = df['eventType'] == 'home_run'
-    df['isOut_'] = df['isOut'].fillna(False)
-
-    # Per-game stats
-    game_stats = df.groupby(
-        ['pitcherId', 'pitcherName', 'pitcherHand', 'gamePk', 'season']
-    ).agg(
-        bf    = ('pitcherId', 'count'),
-        k     = ('isK',    'sum'),
-        bb    = ('isBB',   'sum'),
-        h     = ('isH',    'sum'),
-        hr    = ('isHR',   'sum'),
-        outs  = ('isOut_', 'sum'),
+    # Per-game aggregates per pitcher
+    gstats = df.groupby(['pitcher_id', 'game_pk', 'season']).agg(
+        bf=('pitcher_id', 'count'),
+        k=('is_k', 'sum'),
+        bb=('is_bb', 'sum'),
+        h=('is_h', 'sum'),
+        hr=('is_hr', 'sum'),
+        outs=('is_out', 'sum'),
     ).reset_index()
 
-    # Only keep starts (>= 3 innings)
-    starts = game_stats[game_stats['outs'] >= STARTER_MIN_OUTS].copy()
+    starts = gstats[gstats['outs'] >= STARTER_MIN_OUTS].copy()
+    if starts.empty:
+        print('No qualifying starts.')
+        return
     starts['ip'] = starts['outs'] / 3.0
-
-    # FIP per start: (13·HR + 3·BB - 2·K) / IP + constant
     starts['fip'] = (
         (13 * starts['hr'] + 3 * starts['bb'] - 2 * starts['k'])
         / starts['ip'].replace(0, np.nan)
         + FIP_CONSTANT
     )
 
-    print('Aggregating season stats...')
-    records = []
-    for (pitcher_id, season), grp in starts.groupby(['pitcherId', 'season']):
-        n = len(grp)
-        if n < 2:
+    records: list[dict] = []
+    for (pid, season), grp in starts.groupby(['pitcher_id', 'season']):
+        if len(grp) < 2:
             continue
-
-        total_ip  = grp['ip'].sum()
-        total_bf  = grp['bf'].sum()
-        total_k   = grp['k'].sum()
-        total_bb  = grp['bb'].sum()
-        total_h   = grp['h'].sum()
-        total_hr  = grp['hr'].sum()
-        fip_val   = float(grp['fip'].mean()) if grp['fip'].notna().any() else None
-
         records.append({
-            'pitcherId':    int(pitcher_id),
-            'pitcherName':  grp['pitcherName'].iloc[0],
-            'pitcherHand':  grp['pitcherHand'].iloc[0],
-            'season':       int(season),
-            'gamesStarted': int(n),
-            'avgIP':        round(float(grp['ip'].mean()), 2),
-            'avgK':         round(float(grp['k'].mean()), 2),
-            'avgBB':        round(float(grp['bb'].mean()), 2),
-            'avgH':         round(float(grp['h'].mean()), 2),
-            'avgHR':        round(float(grp['hr'].mean()), 3),
-            'kPct':         round(float(total_k / total_bf), 4) if total_bf > 0 else 0,
-            'bbPct':        round(float(total_bb / total_bf), 4) if total_bf > 0 else 0,
-            'hrPer9':       round(float(total_hr / total_ip * 9), 2) if total_ip > 0 else 0,
-            'whip':         round(float((total_h + total_bb) / total_ip), 3) if total_ip > 0 else 0,
-            'fip':          round(fip_val, 2) if fip_val is not None else None,
+            'pitcher_id': int(pid),
+            'season': int(season),
+            'avg_ip':   round(float(grp['ip'].mean()), 2),
+            'avg_k':    round(float(grp['k'].mean()), 2),
+            'avg_bb':   round(float(grp['bb'].mean()), 2),
+            'avg_h':    round(float(grp['h'].mean()), 2),
+            'avg_hr':   round(float(grp['hr'].mean()), 3),
+            'fip':      round(float(grp['fip'].mean()), 2) if grp['fip'].notna().any() else 0.0,
+            'games_started': int(len(grp)),
         })
 
-    ops = [
-        UpdateOne(
-            {'pitcherId': r['pitcherId'], 'season': r['season']},
-            {'$set': r}, upsert=True,
-        )
-        for r in records
-    ]
-    if ops:
-        db.mlb_pitcher_season_stats.create_index(
-            [('pitcherId', 1), ('season', 1)], unique=True
-        )
-        result = db.mlb_pitcher_season_stats.bulk_write(ops, ordered=False)
-        print(f'  pitcher season stats: {result.upserted_count} inserted, {result.modified_count} updated')
-    print('Done.')
+    session = get_session()
+    try:
+        bulk_upsert(session, PitcherSeasonStats, records,
+                    pk_cols=['pitcher_id', 'season'])
+        session.commit()
+        print(f'  pitcher season stats: {len(records)} rows')
+    finally:
+        session.close()
 
 
 if __name__ == '__main__':

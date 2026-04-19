@@ -1,10 +1,26 @@
 """
 Fetch and parse the feed/live endpoint for a single game.
-Extracts per-pitch records and per-at-bat records.
+Returns (game_update, at_bats, pitches) shaped for the Postgres schema.
 """
 from __future__ import annotations
+
 import requests
+from datetime import date as _date
+
 from config import MLB_API_BASE2
+
+
+PITCH_FAMILY = {
+    'FF': 'fastball', 'FA': 'fastball',
+    'FT': 'sinker',   'SI': 'sinker',
+    'FC': 'cutter',
+    'SL': 'slider',   'ST': 'slider',   'SV': 'slider',
+    'CU': 'curveball', 'KC': 'curveball', 'CS': 'curveball',
+    'CH': 'changeup', 'FO': 'changeup', 'SC': 'changeup',
+    'FS': 'splitter',
+    'KN': 'knuckleball',
+    'EP': 'eephus',
+}
 
 
 def fetch_game_feed(game_pk: int) -> dict | None:
@@ -16,53 +32,40 @@ def fetch_game_feed(game_pk: int) -> dict | None:
     return resp.json()
 
 
-def parse_game(feed: dict, game_meta: dict) -> tuple[list[dict], list[dict]]:
+def parse_game(feed: dict, game_meta: dict) -> tuple[dict, list[dict], list[dict], list[dict]]:
     """
-    Returns (pitches, at_bats) for a game feed.
+    Returns (game_update, at_bats, pitches, players).
 
-    pitch doc fields:
-        gamePk, season, gameDate, venueId, venueName,
-        inning, halfInning, atBatIndex, pitchIndex,
-        pitcherId, pitcherName, pitcherHand,
-        hitterId, hitterName, hitterHand,
-        pitchType, pitchTypeDesc,
-        startSpeed, spinRate, px, pz,
-        balls, strikes,
-        pitchResult (called_strike, swinging_strike, ball, foul, hit_into_play, etc.)
-
-    at_bat doc fields:
-        gamePk, season, gameDate, venueId, venueName,
-        inning, halfInning, atBatIndex,
-        pitcherId, pitcherName, pitcherHand,
-        hitterId, hitterName, hitterHand,
-        event (Single, Double, Triple, Home Run, Strikeout, Walk, etc.),
-        eventType,
-        exitVelocity, launchAngle, totalDistance, trajectory, hardness,
-        hitCoordX, hitCoordY,
-        rbi, isOut
-
-    NOTE: hitData is on the play-ending pitch event (playEvents[i] where isInPlay=True),
-    NOT on the play object itself. This is a common MLB API gotcha.
+    game_update — fields to merge into the `games` row (scores, weather JSON).
+    at_bats — ready for bulk insert into at_bats.
+    pitches — ready for bulk insert into pitches.
+    players — one dict per unique hitter/pitcher seen in this game.
     """
     game_data = feed.get('gameData', {})
     live_data = feed.get('liveData', {})
-    all_plays  = live_data.get('plays', {}).get('allPlays', [])
+    all_plays = live_data.get('plays', {}).get('allPlays', [])
 
-    # Weather is in gameData.weather
-    weather_raw = game_data.get('weather', {})
-    weather = _parse_weather(weather_raw)
+    # Final scores
+    linescore = live_data.get('linescore', {})
+    home_score = linescore.get('teams', {}).get('home', {}).get('runs')
+    away_score = linescore.get('teams', {}).get('away', {}).get('runs')
 
-    common = {
-        'gamePk':    game_meta['gamePk'],
-        'season':    game_meta['season'],
-        'gameDate':  game_meta['gameDate'],
-        'venueId':   game_meta['venueId'],
-        'venueName': game_meta['venueName'],
-        'weather':   weather,
+    weather = _parse_weather(game_data.get('weather', {}))
+
+    game_update = {
+        'game_pk':    game_meta['game_pk'],
+        'home_score': home_score,
+        'away_score': away_score,
+        'weather':    weather,
     }
 
-    pitches  = []
-    at_bats  = []
+    game_pk = game_meta['game_pk']
+    game_date: _date | None = game_meta.get('game_date')
+    season = game_meta.get('season')
+
+    at_bats:  list[dict] = []
+    pitches:  list[dict] = []
+    players:  dict[int, dict] = {}
 
     for play in all_plays:
         if not play.get('about', {}).get('isComplete', False):
@@ -72,88 +75,105 @@ def parse_game(feed: dict, game_meta: dict) -> tuple[list[dict], list[dict]]:
         matchup = play.get('matchup', {})
         result  = play.get('result', {})
 
-        pitcher_id   = matchup.get('pitcher', {}).get('id')
-        pitcher_name = matchup.get('pitcher', {}).get('fullName', '')
-        pitcher_hand = matchup.get('pitchHand', {}).get('code', '')
-        hitter_id    = matchup.get('batter', {}).get('id')
-        hitter_name  = matchup.get('batter', {}).get('fullName', '')
-        hitter_hand  = matchup.get('batSide', {}).get('code', '')
+        pitcher = matchup.get('pitcher', {}) or {}
+        batter  = matchup.get('batter', {}) or {}
+        pitcher_id   = pitcher.get('id')
+        hitter_id    = batter.get('id')
+        pitcher_name = pitcher.get('fullName')
+        hitter_name  = batter.get('fullName')
+        pitcher_hand = matchup.get('pitchHand', {}).get('code')
+        hitter_side  = matchup.get('batSide', {}).get('code')
         ab_index     = about.get('atBatIndex', 0)
         inning       = about.get('inning', 0)
         half         = about.get('halfInning', '')
 
-        ab_base = {
-            **common,
-            'inning':       inning,
-            'halfInning':   half,
-            'atBatIndex':   ab_index,
-            'pitcherId':    pitcher_id,
-            'pitcherName':  pitcher_name,
-            'pitcherHand':  pitcher_hand,
-            'hitterId':     hitter_id,
-            'hitterName':   hitter_name,
-            'hitterHand':   hitter_hand,
-        }
+        if hitter_id and hitter_id not in players:
+            players[hitter_id] = {
+                'player_id': hitter_id,
+                'full_name': hitter_name or '',
+                'bat_side': hitter_side,
+            }
+        if pitcher_id and pitcher_id not in players:
+            players[pitcher_id] = {
+                'player_id': pitcher_id,
+                'full_name': pitcher_name or '',
+                'pitch_hand': pitcher_hand,
+            }
 
-        # ── At-bat record ───────────────────────────────────────────
-        # hitData is on the play-ending pitch event (isInPlay=True), not on the play.
+        # hitData sits on the play-ending pitch event, not the play itself
         hit_data = {}
         for ev in play.get('playEvents', []):
             if ev.get('hitData'):
                 hit_data = ev['hitData']
                 break
+        coords = hit_data.get('coordinates', {}) or {}
 
         at_bats.append({
-            **ab_base,
-            'event':         result.get('event', ''),
-            'eventType':     result.get('eventType', ''),
-            'description':   result.get('description', ''),
-            'rbi':           result.get('rbi', 0),
-            'isOut':         result.get('isOut', False),
-            'exitVelocity':  hit_data.get('launchSpeed'),
-            'launchAngle':   hit_data.get('launchAngle'),
-            'totalDistance': hit_data.get('totalDistance'),
-            'trajectory':    hit_data.get('trajectory'),    # line_drive, fly_ball, ground_ball, popup
-            'hardness':      hit_data.get('hardness'),      # hard, medium, soft
-            'hitLocation':   hit_data.get('location'),      # field zone (1-9)
-            'hitCoordX':     hit_data.get('coordinates', {}).get('coordX'),
-            'hitCoordY':     hit_data.get('coordinates', {}).get('coordY'),
-            'totalPitches':  len([e for e in play.get('playEvents', []) if e.get('type') == 'pitch']),
+            'game_pk':            game_pk,
+            'at_bat_index':       ab_index,
+            'inning':             inning,
+            'half_inning':        half,
+            'hitter_id':          hitter_id,
+            'pitcher_id':         pitcher_id,
+            'hitter_side':        hitter_side,
+            'pitcher_hand':       pitcher_hand,
+            'event':              result.get('event', '')[:80],
+            'event_type':         result.get('eventType', '')[:80],
+            'description':        result.get('description', ''),
+            'rbi':                result.get('rbi', 0) or 0,
+            'exit_velocity':      hit_data.get('launchSpeed'),
+            'launch_angle':       hit_data.get('launchAngle'),
+            'launch_speed_angle': hit_data.get('launchSpeedAngle'),
+            'total_distance':     _to_float(hit_data.get('totalDistance')),
+            'hit_coord_x':        _to_float(coords.get('coordX')),
+            'hit_coord_y':        _to_float(coords.get('coordY')),
+            'trajectory':         hit_data.get('trajectory'),
+            'hardness':           hit_data.get('hardness'),
+            'location':           str(hit_data.get('location')) if hit_data.get('location') is not None else None,
+            'game_date':          game_date,
+            'season':             season,
         })
 
-        # ── Pitch records ────────────────────────────────────────────
+        # Pitch records
         for event in play.get('playEvents', []):
             if event.get('type') != 'pitch':
                 continue
 
-            details   = event.get('details', {})
+            details    = event.get('details', {})
             pitch_data = event.get('pitchData', {})
-            coords    = pitch_data.get('coordinates', {})
-            count     = event.get('count', {})
+            pcoords    = pitch_data.get('coordinates', {})
+            count      = event.get('count', {})
+            ptype_code = details.get('type', {}).get('code')
 
             pitches.append({
-                **ab_base,
-                'pitchIndex':    event.get('index', 0),
-                'pitchType':     details.get('type', {}).get('code', ''),
-                'pitchTypeDesc': details.get('type', {}).get('description', ''),
-                'pitchResult':   details.get('call', {}).get('code', ''),
-                'pitchResultDesc': details.get('description', ''),
-                'startSpeed':    pitch_data.get('startSpeed'),
-                'spinRate':      pitch_data.get('breaks', {}).get('spinRate'),
-                'px':            coords.get('pX'),
-                'pz':            coords.get('pZ'),
+                'game_pk':       game_pk,
+                'at_bat_index':  ab_index,
+                'pitch_index':   event.get('index', 0),
+                'hitter_id':     hitter_id,
+                'pitcher_id':    pitcher_id,
+                'pitch_type':    ptype_code,
+                'pitch_family':  PITCH_FAMILY.get(ptype_code or ''),
+                'start_speed':   pitch_data.get('startSpeed'),
+                'end_speed':     pitch_data.get('endSpeed'),
+                'spin_rate':     (pitch_data.get('breaks') or {}).get('spinRate'),
+                'spin_direction': (pitch_data.get('breaks') or {}).get('spinDirection'),
+                'px':            pcoords.get('pX'),
+                'pz':            pcoords.get('pZ'),
+                'pitch_result':  details.get('call', {}).get('code') or details.get('description'),
+                'zone':          pitch_data.get('zone'),
                 'balls':         count.get('balls', 0),
                 'strikes':       count.get('strikes', 0),
-                'isLastPitch':   event.get('isLastPitch', False),
+                'game_date':     game_date,
+                'season':        season,
             })
 
-    return pitches, at_bats
+    return game_update, at_bats, pitches, list(players.values())
 
 
 def _parse_weather(w: dict) -> dict:
-    """Parse MLB weather string into structured fields."""
+    """Parse MLB weather strings into structured JSON."""
     temp_str = w.get('temp', '')
-    wind_str = w.get('wind', '')  # e.g. "5 mph, L to R"
+    wind_str = w.get('wind', '')
     temp = None
     try:
         temp = int(temp_str)
@@ -161,7 +181,7 @@ def _parse_weather(w: dict) -> dict:
         pass
 
     wind_speed = None
-    wind_dir   = ''
+    wind_dir = ''
     if wind_str:
         parts = wind_str.split(',')
         try:
@@ -172,8 +192,17 @@ def _parse_weather(w: dict) -> dict:
             wind_dir = parts[1].strip()
 
     return {
-        'condition': w.get('condition', ''),
-        'tempF':     temp,
+        'condition':    w.get('condition', ''),
+        'tempF':        temp,
         'windSpeedMph': wind_speed,
-        'windDir':   wind_dir,
+        'windDir':      wind_dir,
     }
+
+
+def _to_float(v):
+    if v is None or v == '':
+        return None
+    try:
+        return float(v)
+    except (ValueError, TypeError):
+        return None

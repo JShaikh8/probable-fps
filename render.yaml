@@ -1,0 +1,44 @@
+# Render Blueprint for sports-oracle-python.
+#
+# Pushing this to GitHub and connecting the repo in Render will provision:
+#   1. A managed Postgres database   (sports-oracle-db)
+#   2. A nightly cron job            (sports-oracle-pipeline)
+#
+# After Render creates the service, run the first-time setup by using the
+# "Shell" tab on the cron service:
+#
+#   python -m db.init_schema                   # create tables
+#   python -m ingest.ingest_runner --seasons 2024 2025 2026   # ~30 min
+#   python -m ingest.fetch_runs                # ~10 min
+#   python run_daily.py --retrain-ml           # features + models + today
+#
+# Or, for a faster start, pg_dump from your local DB and restore to the
+# Render DB (see DEPLOY.md for the exact command).
+
+databases:
+  - name: sports-oracle-db
+    databaseName: sports_oracle
+    user: sportsoracle
+    plan: basic-256mb         # upgrade to 1GB if ingesting all 7 seasons
+    postgresMajorVersion: "16"
+
+services:
+  # Nightly pipeline — reconcile yesterday, ingest new games, refresh features,
+  # build today's projections + NRFI. Default schedule is 11:00 UTC (6am CT),
+  # giving previous night's games time to finalize.
+  - type: cron
+    name: sports-oracle-pipeline
+    runtime: python
+    schedule: "0 11 * * *"
+    plan: starter             # 512 MB RAM; upgrade if ingest OOMs
+    region: oregon            # pick the region closest to your DB
+    rootDir: .
+    buildCommand: pip install --no-cache-dir -r requirements.txt
+    startCommand: python run_daily.py --retrain-ml
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: sports-oracle-db
+          property: connectionString
+      - key: PYTHONUNBUFFERED
+        value: "1"

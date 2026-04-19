@@ -1,70 +1,54 @@
+"""
+Aggregate hitter × pitch-family splits and pitcher arsenal profiles.
+
+Reads from at_bats + pitches, writes hitter_pitch_splits and pitcher_profiles.
+"""
 from __future__ import annotations
-"""
-Aggregate hitter × pitch type splits from mlb_pitches + mlb_at_bats.
 
-Output collection: mlb_hitter_pitch_splits
-One document per (hitterId, pitchType, season) with:
-  pa, ab, hits, doubles, triples, hr, bb, k, hbp,
-  avg, obp, slg, ops,
-  swingPct, whiffPct, chasePct,
-  avgExitVelo, avgLaunchAngle, hardHitPct (exitVelo >= 95)
-
-Also builds: mlb_pitcher_pitch_results
-One doc per (pitcherId, pitchType, season) with usage%, avg velo, whiff%, k_per_pitch
-"""
-import sys
 import pandas as pd
-sys.path.insert(0, '..')
-from config import get_db
 
-# Pitch type groupings (collapse rare variants)
-PITCH_FAMILY = {
-    'FF': 'fastball', 'FA': 'fastball', 'FT': 'sinker', 'SI': 'sinker',
-    'FC': 'cutter',
-    'SL': 'slider', 'ST': 'slider',
-    'CU': 'curveball', 'KC': 'curveball', 'CS': 'curveball',
-    'CH': 'changeup', 'FS': 'splitter', 'FO': 'changeup',
-    'KN': 'knuckleball',
-    'EP': 'eephus',
-}
+from config import get_engine, get_session
+from db.models import HitterPitchSplit, PitcherProfile
+from db.io import bulk_upsert
 
-# MLB pitch result codes → outcome category
-SWING_CODES  = {'S', 'W', 'F', 'T', 'L', 'M', 'O', 'Q', 'R', 'X'}  # any swing
-WHIFF_CODES  = {'S', 'W', 'T', 'L', 'M', 'O', 'Q', 'R'}             # swing and miss
-BALL_CODES   = {'B', 'I', 'P'}
-IN_ZONE      = None  # we'll approximate from px/pz
 
-CONTACT_EVENTS = {'single', 'double', 'triple', 'home_run',
-                  'field_out', 'grounded_into_double_play', 'force_out',
-                  'sac_fly', 'sac_bunt', 'fielders_choice', 'double_play',
-                  'triple_play', 'sac_fly_double_play'}
-HIT_EVENTS     = {'single', 'double', 'triple', 'home_run'}
+# Swing / whiff MLBAM result codes
+SWING_CODES = {'S', 'W', 'F', 'T', 'L', 'M', 'O', 'Q', 'R', 'X'}
+WHIFF_CODES = {'S', 'W', 'T', 'L', 'M', 'O', 'Q', 'R'}
+
+HIT_EVENTS = {'single', 'double', 'triple', 'home_run'}
 
 
 def run(seasons: list[int] | None = None):
-    db = get_db()
-    season_filter = {'season': {'$in': seasons}} if seasons else {}
+    engine = get_engine()
 
-    print('Loading pitches...')
-    pitches_cur = db.mlb_pitches.find(season_filter, {
-        '_id': 0, 'hitterId': 1, 'hitterName': 1, 'hitterHand': 1,
-        'pitcherId': 1, 'pitcherHand': 1,
-        'pitchType': 1, 'pitchResult': 1, 'startSpeed': 1, 'spinRate': 1,
-        'px': 1, 'pz': 1, 'balls': 1, 'strikes': 1,
-        'pitchIndex': 1, 'season': 1, 'atBatIndex': 1, 'gamePk': 1,
-    })
-    pitches = pd.DataFrame(list(pitches_cur))
+    where_pitch = f"WHERE p.season IN ({','.join(str(s) for s in seasons)})" if seasons else ''
+    where_ab    = f"WHERE season IN ({','.join(str(s) for s in seasons)})"   if seasons else ''
 
-    print('Loading at-bats...')
-    abs_cur = db.mlb_at_bats.find(season_filter, {
-        '_id': 0, 'gamePk': 1, 'atBatIndex': 1,
-        'hitterId': 1, 'pitcherId': 1,
-        'event': 1, 'eventType': 1,
-        'exitVelocity': 1, 'launchAngle': 1,
-        'hardness': 1, 'trajectory': 1,  # Statcast qualitative fallbacks
-        'rbi': 1, 'isOut': 1, 'season': 1,
-    })
-    at_bats = pd.DataFrame(list(abs_cur))
+    print('Loading pitches…')
+    pitches = pd.read_sql_query(
+        f"""
+        SELECT p.hitter_id, p.pitcher_id, p.pitch_type, p.pitch_family,
+               p.pitch_result, p.start_speed, p.spin_rate, p.px, p.pz,
+               p.balls, p.strikes, p.pitch_index, p.at_bat_index, p.game_pk,
+               p.season
+        FROM pitches p
+        {where_pitch}
+        """,
+        engine,
+    )
+
+    print('Loading at-bats…')
+    at_bats = pd.read_sql_query(
+        f"""
+        SELECT game_pk, at_bat_index, hitter_id, pitcher_id,
+               event, event_type, exit_velocity, launch_angle,
+               hardness, trajectory, rbi, season
+        FROM at_bats
+        {where_ab}
+        """,
+        engine,
+    )
 
     if pitches.empty or at_bats.empty:
         print('No data found. Run ingest first.')
@@ -72,86 +56,75 @@ def run(seasons: list[int] | None = None):
 
     print(f'  {len(pitches):,} pitches, {len(at_bats):,} at-bats')
 
-    # Map pitch type to family
-    pitches['pitchFamily'] = pitches['pitchType'].map(PITCH_FAMILY).fillna('other')
-    pitches['isSwing']     = pitches['pitchResult'].isin(SWING_CODES)
-    pitches['isWhiff']     = pitches['pitchResult'].isin(WHIFF_CODES)
+    # Drop pitches with no family classification
+    pitches = pitches[pitches['pitch_family'].notna()].copy()
+    pitches['is_swing'] = pitches['pitch_result'].isin(SWING_CODES)
+    pitches['is_whiff'] = pitches['pitch_result'].isin(WHIFF_CODES)
 
-    # ── Velocity / spin tier flags ──────────────────────────────────
-    # Tag each pitch as high-velocity or high-spin relative to league average
-    # for that pitch family × season (top third = "high")
-    print('Computing velocity/spin tier thresholds...')
-    velo_p67 = (
-        pitches.groupby(['pitchFamily', 'season'])['startSpeed']
-        .quantile(0.67).rename('velo_p67').reset_index()
-    )
-    spin_p67 = (
-        pitches.groupby(['pitchFamily', 'season'])['spinRate']
-        .quantile(0.67).rename('spin_p67').reset_index()
-    )
-    pitches = pitches.merge(velo_p67, on=['pitchFamily', 'season'], how='left')
-    pitches = pitches.merge(spin_p67, on=['pitchFamily', 'season'], how='left')
-    pitches['isHighVelo'] = pitches['startSpeed'] >= pitches['velo_p67']
-    pitches['isHighSpin'] = (
-        pitches['spinRate'].notna() & (pitches['spinRate'] >= pitches['spin_p67'])
-    )
+    # Velocity / spin tiers (top third per pitch family × season)
+    print('Computing velocity/spin tier thresholds…')
+    velo_p67 = (pitches.groupby(['pitch_family', 'season'])['start_speed']
+                .quantile(0.67).rename('velo_p67').reset_index())
+    spin_p67 = (pitches.groupby(['pitch_family', 'season'])['spin_rate']
+                .quantile(0.67).rename('spin_p67').reset_index())
+    pitches = pitches.merge(velo_p67, on=['pitch_family', 'season'], how='left')
+    pitches = pitches.merge(spin_p67, on=['pitch_family', 'season'], how='left')
+    pitches['is_high_velo'] = pitches['start_speed'] >= pitches['velo_p67']
+    pitches['is_high_spin'] = pitches['spin_rate'].notna() & (pitches['spin_rate'] >= pitches['spin_p67'])
 
-    # Merge last-pitch of AB with at-bat result (last pitch = max pitchIndex per AB)
-    last_pitch_idx = pitches.groupby(['gamePk', 'atBatIndex'])['pitchIndex'].idxmax()
-    last_pitches = pitches.loc[last_pitch_idx].copy()
-    ab_cols = ['gamePk', 'atBatIndex', 'eventType', 'exitVelocity', 'launchAngle']
-    for col in ['hardness', 'trajectory']:
-        if col in at_bats.columns:
-            ab_cols.append(col)
+    # Merge last pitch of each AB with at-bat result
+    last_idx = pitches.groupby(['game_pk', 'at_bat_index'])['pitch_index'].idxmax()
+    last_pitches = pitches.loc[last_idx].copy()
+    ab_cols = ['game_pk', 'at_bat_index', 'event_type', 'exit_velocity', 'launch_angle', 'hardness', 'trajectory']
     merged = last_pitches.merge(
         at_bats[ab_cols],
-        on=['gamePk', 'atBatIndex'], how='left',
+        on=['game_pk', 'at_bat_index'], how='left',
     )
 
-    # ── Hitter × pitch family × season splits ──────────────────────
-    print('Building hitter pitch splits...')
-    _build_hitter_splits(db, pitches, merged)
+    session = get_session()
+    try:
+        print('Building hitter pitch splits…')
+        _write_hitter_splits(session, pitches, merged)
 
-    # ── Pitcher × pitch family × season profile ────────────────────
-    print('Building pitcher pitch profiles...')
-    _build_pitcher_profiles(db, pitches, merged)
+        print('Building pitcher profiles…')
+        _write_pitcher_profiles(session, pitches, merged)
+
+        session.commit()
+    finally:
+        session.close()
 
     print('Done.')
 
 
-def _build_hitter_splits(db, pitches: pd.DataFrame, merged: pd.DataFrame):
-    groups = merged.groupby(['hitterId', 'pitchFamily', 'season'])
-    records = []
+def _write_hitter_splits(session, pitches: pd.DataFrame, merged: pd.DataFrame):
+    records: list[dict] = []
+    groups = merged.groupby(['hitter_id', 'pitch_family', 'season'])
 
     for (hitter_id, pitch_family, season), grp in groups:
-        pa    = len(grp)
+        pa = len(grp)
         if pa < 5:
             continue
 
-        et    = grp['eventType'].fillna('')
-        hits  = et.isin(HIT_EVENTS).sum()
-        ab    = (~et.isin({'walk', 'intent_walk', 'hit_by_pitch', 'sac_fly', 'sac_bunt'})).sum()
-        bb    = et.isin({'walk', 'intent_walk'}).sum()
-        k     = et.isin({'strikeout', 'strikeout_double_play'}).sum()
-        hr    = (et == 'home_run').sum()
-        dbl   = (et == 'double').sum()
-        tri   = (et == 'triple').sum()
-        hbp   = (et == 'hit_by_pitch').sum()
+        et = grp['event_type'].fillna('')
+        hits = int(et.isin(HIT_EVENTS).sum())
+        ab = int((~et.isin({'walk', 'intent_walk', 'hit_by_pitch', 'sac_fly', 'sac_bunt'})).sum())
+        bb = int(et.isin({'walk', 'intent_walk'}).sum())
+        k  = int(et.isin({'strikeout', 'strikeout_double_play'}).sum())
+        hr = int((et == 'home_run').sum())
+        dbl = int((et == 'double').sum())
+        tri = int((et == 'triple').sum())
+        hbp = int((et == 'hit_by_pitch').sum())
 
-        avg   = hits / ab if ab > 0 else 0
-        obp   = (hits + bb + hbp) / pa if pa > 0 else 0
-        slg_num = (
-            (et == 'single').sum() +
-            dbl * 2 + tri * 3 + hr * 4
-        )
-        slg = slg_num / ab if ab > 0 else 0
+        avg = hits / ab if ab > 0 else 0.0
+        obp = (hits + bb + hbp) / pa if pa > 0 else 0.0
+        slg_num = int((et == 'single').sum()) + dbl * 2 + tri * 3 + hr * 4
+        slg = slg_num / ab if ab > 0 else 0.0
 
-        ev     = grp['exitVelocity'].dropna()
-        avg_ev = float(ev.mean()) if len(ev) > 0 else None
-        avg_la = float(grp['launchAngle'].dropna().mean()) if grp['launchAngle'].notna().any() else None
+        ev = grp['exit_velocity'].dropna()
+        avg_ev = float(ev.mean()) if len(ev) else None
+        avg_la = float(grp['launch_angle'].dropna().mean()) if grp['launch_angle'].notna().any() else None
 
-        # hardHitPct: prefer exitVelocity >= 95; fall back to hardness == 'hard'
-        if len(ev) > 0:
+        if len(ev):
             hard_hit = float((ev >= 95).sum() / len(ev))
         elif 'hardness' in grp.columns and grp['hardness'].notna().any():
             bip = grp['hardness'].notna()
@@ -159,115 +132,87 @@ def _build_hitter_splits(db, pitches: pd.DataFrame, merged: pd.DataFrame):
         else:
             hard_hit = None
 
-        # Swing/whiff from all pitches in this family for this hitter/season
         ph_all = pitches[
-            (pitches['hitterId'] == hitter_id) &
-            (pitches['pitchFamily'] == pitch_family) &
+            (pitches['hitter_id'] == hitter_id) &
+            (pitches['pitch_family'] == pitch_family) &
             (pitches['season'] == season)
         ]
         total_p = len(ph_all)
-        swing_pct = float(ph_all['isSwing'].sum() / total_p) if total_p > 0 else None
-        whiff_pct = float(ph_all['isWhiff'].sum() / ph_all['isSwing'].sum()) if ph_all['isSwing'].sum() > 0 else None
-        avg_speed = float(ph_all['startSpeed'].dropna().mean()) if ph_all['startSpeed'].notna().any() else None
+        swings  = int(ph_all['is_swing'].sum())
+        whiffs  = int(ph_all['is_whiff'].sum())
+        swing_pct = float(swings / total_p) if total_p else None
+        whiff_pct = float(whiffs / swings) if swings else None
 
-        # High-velocity tier whiff rate (top-33% speed for this pitch family/season)
         def _tier_whiff(sub: pd.DataFrame) -> float | None:
-            swings = int(sub['isSwing'].sum())
-            whiffs = int(sub['isWhiff'].sum())
-            return round(float(whiffs / swings), 4) if swings >= 5 else None
+            s = int(sub['is_swing'].sum())
+            w = int(sub['is_whiff'].sum())
+            return round(float(w / s), 4) if s >= 5 else None
 
-        high_velo_whiff = _tier_whiff(ph_all[ph_all['isHighVelo']]) if 'isHighVelo' in ph_all.columns else None
-        high_spin_whiff = _tier_whiff(ph_all[ph_all['isHighSpin']]) if 'isHighSpin' in ph_all.columns else None
+        high_velo_whiff = _tier_whiff(ph_all[ph_all['is_high_velo']])
+        high_spin_whiff = _tier_whiff(ph_all[ph_all['is_high_spin']])
 
         records.append({
-            'hitterId':       int(hitter_id),
-            'hitterName':     grp['hitterName'].iloc[0] if 'hitterName' in grp.columns else '',
-            'pitchFamily':    pitch_family,
-            'season':         int(season),
-            'pa': int(pa), 'ab': int(ab), 'hits': int(hits),
-            'doubles': int(dbl), 'triples': int(tri), 'hr': int(hr),
-            'bb': int(bb), 'k': int(k), 'hbp': int(hbp),
-            'avg': round(avg, 4), 'obp': round(obp, 4),
-            'slg': round(slg, 4), 'ops': round(obp + slg, 4),
-            'swingPct': round(swing_pct, 4) if swing_pct is not None else None,
-            'whiffPct': round(whiff_pct, 4) if whiff_pct is not None else None,
-            'avgFacedSpeed': round(avg_speed, 1) if avg_speed is not None else None,
-            'avgExitVelo': round(avg_ev, 1) if avg_ev is not None else None,
-            'avgLaunchAngle': round(avg_la, 1) if avg_la is not None else None,
-            'hardHitPct': round(hard_hit, 4) if hard_hit is not None else None,
-            'highVeloWhiffPct': high_velo_whiff,
-            'highSpinWhiffPct': high_spin_whiff,
+            'hitter_id': int(hitter_id),
+            'pitch_family': pitch_family,
+            'season': int(season),
+            'pa': int(pa), 'ab': ab, 'hits': hits,
+            'hr': hr, 'bb': bb, 'k': k,
+            'avg': round(avg, 4), 'slg': round(slg, 4),
+            'obp': round(obp, 4), 'ops': round(obp + slg, 4),
+            'swing_pct': round(swing_pct, 4) if swing_pct is not None else None,
+            'whiff_pct': round(whiff_pct, 4) if whiff_pct is not None else None,
+            'avg_exit_velo': round(avg_ev, 1) if avg_ev is not None else None,
+            'avg_launch_angle': round(avg_la, 1) if avg_la is not None else None,
+            'hard_hit_pct': round(hard_hit, 4) if hard_hit is not None else None,
+            'high_velo_whiff_pct': high_velo_whiff,
+            'high_spin_whiff_pct': high_spin_whiff,
         })
 
-    from pymongo import UpdateOne
-    ops = [
-        UpdateOne(
-            {'hitterId': r['hitterId'], 'pitchFamily': r['pitchFamily'], 'season': r['season']},
-            {'$set': r}, upsert=True,
-        )
-        for r in records
-    ]
-    if ops:
-        db.mlb_hitter_pitch_splits.create_index(
-            [('hitterId', 1), ('pitchFamily', 1), ('season', 1)], unique=True
-        )
-        result = db.mlb_hitter_pitch_splits.bulk_write(ops, ordered=False)
-        print(f'  hitter splits: {result.upserted_count} inserted, {result.modified_count} updated')
+    bulk_upsert(session, HitterPitchSplit, records,
+                pk_cols=['hitter_id', 'pitch_family', 'season'])
+    print(f'  hitter splits: {len(records)} rows')
 
 
-def _build_pitcher_profiles(db, pitches: pd.DataFrame, merged: pd.DataFrame):
-    """One doc per pitcher/season: arsenal mix, avg velo per pitch, whiff%, command."""
-    groups = pitches.groupby(['pitcherId', 'season'])
-    records = []
+def _write_pitcher_profiles(session, pitches: pd.DataFrame, merged: pd.DataFrame):
+    records: list[dict] = []
+    groups = pitches.groupby(['pitcher_id', 'season'])
 
     for (pitcher_id, season), grp in groups:
         total = len(grp)
         if total < 50:
             continue
 
-        arsenal = {}
-        for pf, sub in grp.groupby('pitchFamily'):
+        arsenal: dict = {}
+        for pf, sub in grp.groupby('pitch_family'):
             n = len(sub)
-            whiffs = sub['isWhiff'].sum()
-            swings = sub['isSwing'].sum()
+            whiffs = int(sub['is_whiff'].sum())
+            swings = int(sub['is_swing'].sum())
             arsenal[pf] = {
                 'count':    int(n),
                 'usagePct': round(n / total, 4),
-                'avgSpeed': round(float(sub['startSpeed'].dropna().mean()), 1) if sub['startSpeed'].notna().any() else None,
-                'avgSpin':  round(float(sub['spinRate'].dropna().mean()), 0) if sub['spinRate'].notna().any() else None,
-                'whiffPct': round(float(whiffs / swings), 4) if swings > 0 else None,
+                'avgSpeed': round(float(sub['start_speed'].dropna().mean()), 1) if sub['start_speed'].notna().any() else None,
+                'avgSpin':  round(float(sub['spin_rate'].dropna().mean()), 0) if sub['spin_rate'].notna().any() else None,
+                'whiffPct': round(float(whiffs / swings), 4) if swings else None,
             }
 
-        # Overall strikeout rate from at-bat outcomes
-        ab_sub = merged[(merged['pitcherId'] == pitcher_id) & (merged['season'] == season)]
+        ab_sub = merged[(merged['pitcher_id'] == pitcher_id) & (merged['season'] == season)]
         k_pct = None
-        if len(ab_sub) > 0:
-            k = ab_sub['eventType'].isin({'strikeout', 'strikeout_double_play'}).sum()
+        if len(ab_sub):
+            k = int(ab_sub['event_type'].isin({'strikeout', 'strikeout_double_play'}).sum())
             k_pct = round(float(k / len(ab_sub)), 4)
 
         records.append({
-            'pitcherId':   int(pitcher_id),
-            'pitcherName': grp['pitcherName'].iloc[0] if 'pitcherName' in grp.columns else '',
-            'pitcherHand': grp['pitcherHand'].iloc[0] if 'pitcherHand' in grp.columns else '',
-            'season':      int(season),
-            'totalPitches': int(total),
-            'arsenal':     arsenal,
-            'primaryPitch': max(arsenal, key=lambda k: arsenal[k]['usagePct']) if arsenal else None,
-            'kPct':        k_pct,
+            'pitcher_id': int(pitcher_id),
+            'season': int(season),
+            'arsenal': arsenal,
+            'total_pitches': int(total),
+            'k_pct': k_pct or 0.0,
+            'primary_pitch': max(arsenal, key=lambda kk: arsenal[kk]['usagePct']) if arsenal else None,
         })
 
-    from pymongo import UpdateOne
-    ops = [
-        UpdateOne(
-            {'pitcherId': r['pitcherId'], 'season': r['season']},
-            {'$set': r}, upsert=True,
-        )
-        for r in records
-    ]
-    if ops:
-        db.mlb_pitcher_profiles.create_index([('pitcherId', 1), ('season', 1)], unique=True)
-        result = db.mlb_pitcher_profiles.bulk_write(ops, ordered=False)
-        print(f'  pitcher profiles: {result.upserted_count} inserted, {result.modified_count} updated')
+    bulk_upsert(session, PitcherProfile, records,
+                pk_cols=['pitcher_id', 'season'])
+    print(f'  pitcher profiles: {len(records)} rows')
 
 
 if __name__ == '__main__':

@@ -1,0 +1,29 @@
+# env
+.env
+.env.*
+!.env.example
+
+# python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# jupyter
+.ipynb_checkpoints/
+
+# editor / os
+.DS_Store
+.vscode/
+.idea/
+
+# data dumps from run_daily
+*.jsonl
+mlb-pipeline-data/
+
+# Trained ML models — retrained on every --retrain-ml cron run
+/artifacts/
