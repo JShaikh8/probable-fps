@@ -1,0 +1,42 @@
+name: nightly pipeline
+
+# Free tier: 2,000 minutes/month. Our pipeline uses ~10 min/night so
+# ~300 min/month — well within the cap.
+on:
+  schedule:
+    - cron: "0 11 * * *"      # 11:00 UTC = 6am CT
+  workflow_dispatch:           # lets you manually trigger from the Actions tab
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60         # hard cap to avoid runaway bills
+
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install deps
+        run: pip install --no-cache-dir -r requirements.txt
+
+      - name: Run daily pipeline
+        run: python run_daily.py --retrain-ml
+
+      - name: Report summary
+        if: always()
+        run: |
+          echo "### Nightly run summary" >> $GITHUB_STEP_SUMMARY
+          echo "- Date: $(date -u +%F)" >> $GITHUB_STEP_SUMMARY
+          echo "- Status: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
