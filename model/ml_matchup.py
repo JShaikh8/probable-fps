@@ -103,13 +103,24 @@ FEATURES = [
     'h_avg_vs_primary', 'h_whiff_vs_primary', 'h_hard_hit_vs_primary',
     'h_form_ratio',
     'lineup_slot',
-    # NEW: point-in-time rolling hitter stats (trailing N games before THIS game)
+    # Point-in-time rolling hitter stats (trailing N games before THIS game)
     'h_roll30_avg', 'h_roll30_slg', 'h_roll30_hr_rate',
     'h_roll30_k_rate', 'h_roll30_bb_rate', 'h_roll30_games',
     'h_roll10_avg', 'h_roll10_slg', 'h_roll10_pa',
     # Pitcher rolling (trailing 5 starts)
     'p_roll5_k_rate', 'p_roll5_bb_rate', 'p_roll5_hr_rate',
     'p_roll5_baa', 'p_roll5_starts',
+    # Phase 1/2/A additions: batted-ball quality, pitcher-hand splits,
+    # fly-ball field distribution × physical park dimensions.
+    'h_barrel_pct', 'h_fb_pct', 'h_hard_hit_pct',
+    'p_hr9_matched', 'p_kpct_matched', 'p_fb_allowed', 'p_barrel_allowed',
+    'h_fb_lf_pct', 'h_fb_cf_pct', 'h_fb_rf_pct',
+    'park_lf_ft', 'park_cf_ft', 'park_rf_ft',
+    # Phase-4: pitcher movement profile on primary pitch (aggregates across
+    # pitch family, weighted by usage). These differentiate sweepers vs gyros,
+    # riding FBs vs sinkers, short-arm vs over-the-top release.
+    'p_avg_pfx_x', 'p_avg_pfx_z', 'p_avg_extension', 'p_avg_x0', 'p_avg_z0',
+    'p_primary_pfx_x', 'p_primary_pfx_z', 'p_primary_extension',
 ]
 
 
@@ -172,17 +183,53 @@ def build_training_frame() -> pd.DataFrame:
         """,
         engine,
     )
-    # Extract primary-pitch usage and avg velocity
+    # Extract primary-pitch usage, avg velocity, and (Phase-4) movement
+    # aggregates. Some fields only populate once pitch re-ingest has run.
     def _arsenal_features(arsenal: dict | None) -> pd.Series:
+        base = {
+            'pk_fastball_usage': np.nan, 'pk_primary_velo': np.nan,
+            'p_avg_pfx_x': np.nan, 'p_avg_pfx_z': np.nan,
+            'p_avg_extension': np.nan, 'p_avg_x0': np.nan, 'p_avg_z0': np.nan,
+            'p_primary_pfx_x': np.nan, 'p_primary_pfx_z': np.nan,
+            'p_primary_extension': np.nan,
+        }
         if not arsenal:
-            return pd.Series({'pk_fastball_usage': np.nan, 'pk_primary_velo': np.nan})
+            return pd.Series(base)
         fb_usage = (arsenal.get('fastball') or {}).get('usagePct')
-        primary = max(arsenal.items(), key=lambda kv: (kv[1] or {}).get('usagePct', 0))
-        primary_velo = (primary[1] or {}).get('avgSpeed')
-        return pd.Series({
+        primary_fam, primary_info = max(arsenal.items(), key=lambda kv: (kv[1] or {}).get('usagePct', 0))
+        primary_info = primary_info or {}
+
+        # Usage-weighted movement averages across all pitch families
+        total_usage = 0.0
+        acc = {'pfxX': 0.0, 'pfxZ': 0.0, 'ext': 0.0, 'x0': 0.0, 'z0': 0.0}
+        have = {k: 0.0 for k in acc}
+        for info in arsenal.values():
+            if not info: continue
+            u = info.get('usagePct') or 0
+            for k, src in [('pfxX', 'avgPfxX'), ('pfxZ', 'avgPfxZ'),
+                           ('ext', 'avgExtension'), ('x0', 'avgX0'), ('z0', 'avgZ0')]:
+                v = info.get(src)
+                if v is not None:
+                    acc[k] += u * v
+                    have[k] += u
+            total_usage += u
+
+        def _safe(k):
+            return acc[k] / have[k] if have[k] > 0 else np.nan
+
+        base.update({
             'pk_fastball_usage': fb_usage,
-            'pk_primary_velo': primary_velo,
+            'pk_primary_velo': primary_info.get('avgSpeed'),
+            'p_avg_pfx_x': _safe('pfxX'),
+            'p_avg_pfx_z': _safe('pfxZ'),
+            'p_avg_extension': _safe('ext'),
+            'p_avg_x0': _safe('x0'),
+            'p_avg_z0': _safe('z0'),
+            'p_primary_pfx_x': primary_info.get('avgPfxX'),
+            'p_primary_pfx_z': primary_info.get('avgPfxZ'),
+            'p_primary_extension': primary_info.get('avgExtension'),
         })
+        return pd.Series(base)
 
     arsenal_ext = p_arsenal['arsenal'].apply(_arsenal_features)
     p_arsenal = pd.concat([p_arsenal[['pitcher_id', 'season']], arsenal_ext], axis=1)
@@ -320,12 +367,56 @@ def build_training_frame() -> pd.DataFrame:
         SELECT hitter_id,
                avg_exit_velo AS h_avg_exit_velo,
                avg_launch_angle AS h_avg_launch_angle,
-               pull_pct AS h_pull_pct
+               pull_pct AS h_pull_pct,
+               fb_lf_pct AS h_fb_lf_pct,
+               fb_cf_pct AS h_fb_cf_pct,
+               fb_rf_pct AS h_fb_rf_pct
         FROM hitter_spray_profiles
         """,
         engine,
     )
     df = df.merge(spray, on='hitter_id', how='left')
+
+    print('Phase-2: hitter barrel/FB/hard-hit (season rollup)…')
+    hbb = pd.read_sql_query(
+        """
+        SELECT hitter_id, season + 1 AS season,
+               SUM(pa * COALESCE(barrel_pct, 0))::float    / NULLIF(SUM(CASE WHEN barrel_pct IS NOT NULL THEN pa END), 0) AS h_barrel_pct,
+               SUM(pa * COALESCE(fb_pct, 0))::float        / NULLIF(SUM(CASE WHEN fb_pct IS NOT NULL THEN pa END), 0)     AS h_fb_pct,
+               SUM(pa * COALESCE(hard_hit_pct, 0))::float  / NULLIF(SUM(CASE WHEN hard_hit_pct IS NOT NULL THEN pa END), 0) AS h_hard_hit_pct
+        FROM hitter_pitch_splits GROUP BY hitter_id, season
+        """,
+        engine,
+    )
+    df = df.merge(hbb, on=['hitter_id', 'season'], how='left')
+
+    print('Phase-2: pitcher handedness + batted-ball-allowed…')
+    pss_split = pd.read_sql_query(
+        """
+        SELECT pitcher_id, season + 1 AS season,
+               hr9_vs_l, hr9_vs_r, k_pct_vs_l, k_pct_vs_r,
+               fb_pct_allowed AS p_fb_allowed,
+               barrel_pct_allowed AS p_barrel_allowed
+        FROM pitcher_season_stats
+        """,
+        engine,
+    )
+    df = df.merge(pss_split, on=['pitcher_id', 'season'], how='left')
+    df['p_hr9_matched']  = np.where(df['hitter_side'] == 'L', df['hr9_vs_l'],
+                           np.where(df['hitter_side'] == 'R', df['hr9_vs_r'], np.nan))
+    df['p_kpct_matched'] = np.where(df['hitter_side'] == 'L', df['k_pct_vs_l'],
+                           np.where(df['hitter_side'] == 'R', df['k_pct_vs_r'], np.nan))
+    df.drop(columns=['hr9_vs_l', 'hr9_vs_r', 'k_pct_vs_l', 'k_pct_vs_r'], inplace=True)
+
+    print('Phase-A: venue physical fence dimensions…')
+    dims = pd.read_sql_query(
+        """
+        SELECT g.game_pk, v.lf_ft AS park_lf_ft, v.cf_ft AS park_cf_ft, v.rf_ft AS park_rf_ft
+        FROM games g LEFT JOIN venues v ON v.venue_id = g.venue_id
+        """,
+        engine,
+    )
+    df = df.merge(dims, on='game_pk', how='left')
 
     print('Hitter recent form…')
     form = pd.read_sql_query(
@@ -382,6 +473,16 @@ def build_training_frame() -> pd.DataFrame:
         'h_roll10_avg': 0.248, 'h_roll10_slg': 0.405, 'h_roll10_pa': 0,
         'p_roll5_k_rate': 0.22, 'p_roll5_bb_rate': 0.085,
         'p_roll5_hr_rate': 0.028, 'p_roll5_baa': 0.248, 'p_roll5_starts': 0,
+        # Phase 1/2/A defaults (league means of current data distribution)
+        'h_barrel_pct': 0.06, 'h_fb_pct': 0.32, 'h_hard_hit_pct': 0.36,
+        'p_hr9_matched': 1.85, 'p_kpct_matched': 0.22,
+        'p_fb_allowed': 0.34, 'p_barrel_allowed': 0.06,
+        'h_fb_lf_pct': 0.29, 'h_fb_cf_pct': 0.40, 'h_fb_rf_pct': 0.31,
+        'park_lf_ft': 332.7, 'park_cf_ft': 404.6, 'park_rf_ft': 328.9,
+        # Phase-4 pitcher-movement defaults (league mean of our data)
+        'p_avg_pfx_x': 0.0, 'p_avg_pfx_z': 8.0, 'p_avg_extension': 6.3,
+        'p_avg_x0': -1.0, 'p_avg_z0': 5.9,
+        'p_primary_pfx_x': 0.0, 'p_primary_pfx_z': 8.0, 'p_primary_extension': 6.3,
     }
     for c, v in defaults.items():
         if c not in df.columns:
@@ -553,18 +654,25 @@ def predict(game_date: str | None = None):
         SELECT p.hitter_id, p.pitcher_id, p.game_pk, p.dk_pts, p.expected_pa, p.lineup_slot,
                p.hitter_hand, p.pitcher_hand, g.season, g.weather,
                pf.hr_factor, pf.hit_factor, pf.k_factor,
+               v.lf_ft AS park_lf_ft, v.cf_ft AS park_cf_ft, v.rf_ft AS park_rf_ft,
                pss.fip AS p_prior_fip, pss.games_started AS p_prior_games_started,
                pss.avg_k, pss.avg_bb, pss.avg_hr, pss.avg_ip,
+               pss.hr9_vs_l, pss.hr9_vs_r, pss.k_pct_vs_l, pss.k_pct_vs_r,
+               pss.fb_pct_allowed AS p_fb_allowed,
+               pss.barrel_pct_allowed AS p_barrel_allowed,
                pp.arsenal, pp.primary_pitch AS primary_family,
                hp.h_prior_pa, hp.h_prior_avg, hp.h_prior_slg,
                hp.h_prior_hr_rate, hp.h_prior_k_rate, hp.h_prior_bb_rate,
                sp.avg_exit_velo AS h_avg_exit_velo,
                sp.avg_launch_angle AS h_avg_launch_angle,
                sp.pull_pct AS h_pull_pct,
+               sp.fb_lf_pct AS h_fb_lf_pct, sp.fb_cf_pct AS h_fb_cf_pct,
+               sp.fb_rf_pct AS h_fb_rf_pct,
                rf.form_ratio AS h_form_ratio,
                hs.avg AS h_avg_vs_primary,
                hs.whiff_pct AS h_whiff_vs_primary,
                hs.hard_hit_pct AS h_hard_hit_vs_primary,
+               hbb.h_barrel_pct, hbb.h_fb_pct, hbb.h_hard_hit_pct,
                hr.h_roll30_avg, hr.h_roll30_slg, hr.h_roll30_hr_rate,
                hr.h_roll30_k_rate, hr.h_roll30_bb_rate, hr.h_roll30_games,
                hr.h_roll10_avg, hr.h_roll10_slg, hr.h_roll10_pa,
@@ -572,6 +680,7 @@ def predict(game_date: str | None = None):
                pr.p_roll5_baa, pr.p_roll5_starts
         FROM projections p
         JOIN games g ON g.game_pk = p.game_pk
+        LEFT JOIN venues v ON v.venue_id = g.venue_id
         LEFT JOIN park_factors pf ON pf.venue_id = g.venue_id
         LEFT JOIN hitter_prior hp ON hp.hitter_id = p.hitter_id AND hp.season = g.season
         LEFT JOIN hitter_rolling hr ON hr.hitter_id = p.hitter_id
@@ -592,6 +701,14 @@ def predict(game_date: str | None = None):
           WHERE hs.hitter_id = p.hitter_id AND hs.pitch_family = pp.primary_pitch
           ORDER BY hs.season DESC LIMIT 1
         ) hs ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT
+            SUM(pa * COALESCE(barrel_pct, 0))::float   / NULLIF(SUM(CASE WHEN barrel_pct IS NOT NULL THEN pa END), 0) AS h_barrel_pct,
+            SUM(pa * COALESCE(fb_pct, 0))::float       / NULLIF(SUM(CASE WHEN fb_pct IS NOT NULL THEN pa END), 0)     AS h_fb_pct,
+            SUM(pa * COALESCE(hard_hit_pct, 0))::float / NULLIF(SUM(CASE WHEN hard_hit_pct IS NOT NULL THEN pa END), 0) AS h_hard_hit_pct
+          FROM hitter_pitch_splits
+          WHERE hitter_id = p.hitter_id AND season = g.season
+        ) hbb ON TRUE
         WHERE p.game_date = '{game_date}'
         """,
         engine,
@@ -610,14 +727,40 @@ def predict(game_date: str | None = None):
             return np.nan
 
     def _arsenal(arsenal: dict | None) -> pd.Series:
+        base = {
+            'pk_fastball_usage': np.nan, 'pk_primary_velo': np.nan,
+            'p_avg_pfx_x': np.nan, 'p_avg_pfx_z': np.nan,
+            'p_avg_extension': np.nan, 'p_avg_x0': np.nan, 'p_avg_z0': np.nan,
+            'p_primary_pfx_x': np.nan, 'p_primary_pfx_z': np.nan,
+            'p_primary_extension': np.nan,
+        }
         if not arsenal:
-            return pd.Series({'pk_fastball_usage': np.nan, 'pk_primary_velo': np.nan})
+            return pd.Series(base)
         fb = (arsenal.get('fastball') or {}).get('usagePct')
-        primary = max(arsenal.items(), key=lambda kv: (kv[1] or {}).get('usagePct', 0))
-        return pd.Series({
+        primary_fam, primary_info = max(arsenal.items(), key=lambda kv: (kv[1] or {}).get('usagePct', 0))
+        primary_info = primary_info or {}
+        acc = {'pfxX': 0.0, 'pfxZ': 0.0, 'ext': 0.0, 'x0': 0.0, 'z0': 0.0}
+        have = {k: 0.0 for k in acc}
+        for info in arsenal.values():
+            if not info: continue
+            u = info.get('usagePct') or 0
+            for k, src in [('pfxX', 'avgPfxX'), ('pfxZ', 'avgPfxZ'),
+                           ('ext', 'avgExtension'), ('x0', 'avgX0'), ('z0', 'avgZ0')]:
+                v = info.get(src)
+                if v is not None:
+                    acc[k] += u * v; have[k] += u
+        def _safe(k): return acc[k] / have[k] if have[k] > 0 else np.nan
+        base.update({
             'pk_fastball_usage': fb,
-            'pk_primary_velo': (primary[1] or {}).get('avgSpeed'),
+            'pk_primary_velo': primary_info.get('avgSpeed'),
+            'p_avg_pfx_x': _safe('pfxX'), 'p_avg_pfx_z': _safe('pfxZ'),
+            'p_avg_extension': _safe('ext'),
+            'p_avg_x0': _safe('x0'), 'p_avg_z0': _safe('z0'),
+            'p_primary_pfx_x': primary_info.get('avgPfxX'),
+            'p_primary_pfx_z': primary_info.get('avgPfxZ'),
+            'p_primary_extension': primary_info.get('avgExtension'),
         })
+        return pd.Series(base)
 
     df['temp_f'] = df.apply(lambda r: _w(r, 'tempF'), axis=1)
     df['wind_speed_mph'] = df.apply(lambda r: _w(r, 'windSpeedMph'), axis=1)
@@ -638,6 +781,12 @@ def predict(game_date: str | None = None):
         ((df['hitter_hand'] == 'R') & (df['pitcher_hand'] == 'L'))
     ).astype(int)
 
+    # Phase-2: resolve pitcher hand-split HR/9 and K% matched to hitter side
+    df['p_hr9_matched']  = np.where(df['hitter_hand'] == 'L', df['hr9_vs_l'],
+                           np.where(df['hitter_hand'] == 'R', df['hr9_vs_r'], np.nan))
+    df['p_kpct_matched'] = np.where(df['hitter_hand'] == 'L', df['k_pct_vs_l'],
+                           np.where(df['hitter_hand'] == 'R', df['k_pct_vs_r'], np.nan))
+
     defaults = {
         'h_prior_avg': 0.248, 'h_prior_slg': 0.405,
         'h_prior_hr_rate': 0.030, 'h_prior_k_rate': 0.22, 'h_prior_bb_rate': 0.085,
@@ -656,6 +805,16 @@ def predict(game_date: str | None = None):
         'h_roll10_avg': 0.248, 'h_roll10_slg': 0.405, 'h_roll10_pa': 0,
         'p_roll5_k_rate': 0.22, 'p_roll5_bb_rate': 0.085,
         'p_roll5_hr_rate': 0.028, 'p_roll5_baa': 0.248, 'p_roll5_starts': 0,
+        # Phase 1/2/A defaults (league means of current data distribution)
+        'h_barrel_pct': 0.06, 'h_fb_pct': 0.32, 'h_hard_hit_pct': 0.36,
+        'p_hr9_matched': 1.85, 'p_kpct_matched': 0.22,
+        'p_fb_allowed': 0.34, 'p_barrel_allowed': 0.06,
+        'h_fb_lf_pct': 0.29, 'h_fb_cf_pct': 0.40, 'h_fb_rf_pct': 0.31,
+        'park_lf_ft': 332.7, 'park_cf_ft': 404.6, 'park_rf_ft': 328.9,
+        # Phase-4 pitcher-movement defaults (league mean of our data)
+        'p_avg_pfx_x': 0.0, 'p_avg_pfx_z': 8.0, 'p_avg_extension': 6.3,
+        'p_avg_x0': -1.0, 'p_avg_z0': 5.9,
+        'p_primary_pfx_x': 0.0, 'p_primary_pfx_z': 8.0, 'p_primary_extension': 6.3,
     }
     for c, v in defaults.items():
         if c not in df.columns:

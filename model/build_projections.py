@@ -45,6 +45,14 @@ DEFAULT_PA   = 4.0
 MIN_PA_BLEND = 20
 SIMILAR_TOP  = 5
 
+# Phase-4: empirical-Bayes shrinkage toward archetype-peer mean. Treats peer
+# average as a prior; own sample pulls the posterior. SHRINKAGE_PRIOR_N is the
+# "equivalent own PAs" at which prior weight drops to 50%.
+#   post = own_pa / (own_pa + SHRINKAGE_PRIOR_N) * own
+#        + SHRINKAGE_PRIOR_N / (own_pa + SHRINKAGE_PRIOR_N) * peer
+# So 10 PAs ≈ 29% own / 71% peer; 100 PAs ≈ 80% own / 20% peer; 400 PAs ≈ 94%.
+SHRINKAGE_PRIOR_N = 25
+
 PITCH_FAMILIES = ['fastball', 'sinker', 'cutter', 'slider', 'curveball', 'changeup']
 
 # League-average arsenal weights (for baseline hitter computation)
@@ -146,6 +154,7 @@ def run(game_date: str | None = None):
             proj = project_hitter(
                 m, pitcher_profiles, hitter_splits, hitter_similar,
                 park_factors, recent_form, spray_profiles,
+                pitcher_season_stats=pitcher_season_stats,
             )
             hitter_rows.append(_to_hitter_row(proj, m, game_date))
         except Exception as e:
@@ -222,7 +231,8 @@ def _to_pitcher_row(proj: dict, pm: dict, game_date: str) -> dict:
 
 def project_hitter(m: dict, pitcher_profiles: dict, hitter_splits: dict,
                    hitter_similar: dict, park_factors: dict, recent_form: dict,
-                   spray_profiles: dict | None = None) -> dict:
+                   spray_profiles: dict | None = None,
+                   pitcher_season_stats: dict | None = None) -> dict:
 
     pitcher_id  = m['pitcherId']
     hitter_id   = m['hitterId']
@@ -259,17 +269,31 @@ def project_hitter(m: dict, pitcher_profiles: dict, hitter_splits: dict,
         split = hitter_splits.get((hitter_id, pitch_fam))
         split_pa = split.get('pa', 0) if split else 0
 
-        if split and split_pa >= MIN_PA_BLEND:
-            h_avg  = split.get('avg', 0.250) or 0.250
-            h_slg  = split.get('slg', 0.380) or 0.380
-            h_k    = split.get('k', 0) / max(split.get('pa', 1), 1)
-            h_bb   = split.get('bb', 0) / max(split.get('pa', 1), 1)
-            h_hr   = split.get('hr', 0) / max(split.get('ab', 1), 1)
+        # Always compute peer mean from top-N similar (used as prior)
+        peer_avg, peer_slg, peer_k, peer_bb, peer_hr, peer_w = _blend_with_similar(
+            hitter_id, pitch_fam, hitter_splits, hitter_similar, split
+        )
+
+        if split and split_pa > 0:
+            own_avg = split.get('avg', 0.250) or 0.250
+            own_slg = split.get('slg', 0.380) or 0.380
+            own_k   = split.get('k', 0) / max(split_pa, 1)
+            own_bb  = split.get('bb', 0) / max(split_pa, 1)
+            own_hr  = split.get('hr', 0) / max(split.get('ab', 1), 1)
+
+            # Empirical-Bayes shrinkage — pull own rates toward peer mean.
+            # α = own_pa / (own_pa + SHRINKAGE_PRIOR_N)
+            alpha = split_pa / (split_pa + SHRINKAGE_PRIOR_N)
+            h_avg = alpha * own_avg + (1 - alpha) * peer_avg
+            h_slg = alpha * own_slg + (1 - alpha) * peer_slg
+            h_k   = alpha * own_k   + (1 - alpha) * peer_k
+            h_bb  = alpha * own_bb  + (1 - alpha) * peer_bb
+            h_hr  = alpha * own_hr  + (1 - alpha) * peer_hr
             blend_w = 1.0
         else:
-            h_avg, h_slg, h_k, h_bb, h_hr, blend_w = _blend_with_similar(
-                hitter_id, pitch_fam, hitter_splits, hitter_similar, split
-            )
+            # No own data at all — use peer mean directly
+            h_avg, h_slg, h_k, h_bb, h_hr, blend_w = \
+                peer_avg, peer_slg, peer_k, peer_bb, peer_hr, peer_w
 
         w = usage * blend_w
         proj_avg     += h_avg  * w
@@ -279,30 +303,38 @@ def project_hitter(m: dict, pitcher_profiles: dict, hitter_splits: dict,
         proj_hr_rate += h_hr   * w
         total_weight += w
 
-    # Accumulate contact quality (launch angle, exit velo) weighted by pitch usage
+    # Accumulate contact quality (launch angle, exit velo, barrel%, FB%, hard-hit%)
+    # weighted by pitch usage. These are Phase-1 batted-ball-quality features —
+    # barrel%/FB% drive HR multiplier; hard-hit% drives hit multiplier.
     proj_launch_angle = 0.0
     proj_exit_velo    = 0.0
-    la_weight = 0.0
+    proj_barrel_pct   = 0.0
+    proj_fb_pct       = 0.0
+    proj_hard_hit     = 0.0
+    la_weight = ev_weight = barrel_weight = fb_weight = hh_weight = 0.0
     for pitch_fam, pitch_info in arsenal.items():
         usage = pitch_info.get('usagePct', 0)
         if usage < 0.03:
             continue
         split = hitter_splits.get((hitter_id, pitch_fam))
-        if split:
-            la = split.get('avgLaunchAngle')
-            ev = split.get('avgExitVelo')
-            if la is not None:
-                proj_launch_angle += la * usage
-                la_weight += usage
-            if ev is not None:
-                proj_exit_velo += ev * usage
+        if not split:
+            continue
+        la = split.get('avgLaunchAngle')
+        ev = split.get('avgExitVelo')
+        bp = split.get('barrelPct')
+        fp = split.get('fbPct')
+        hh = split.get('hardHitPct')
+        if la is not None: proj_launch_angle += la * usage; la_weight += usage
+        if ev is not None: proj_exit_velo    += ev * usage; ev_weight += usage
+        if bp is not None: proj_barrel_pct   += bp * usage; barrel_weight += usage
+        if fp is not None: proj_fb_pct       += fp * usage; fb_weight += usage
+        if hh is not None: proj_hard_hit     += hh * usage; hh_weight += usage
 
-    if la_weight > 0:
-        proj_launch_angle /= la_weight
-        proj_exit_velo    = proj_exit_velo / la_weight if la_weight > 0 else None
-    else:
-        proj_launch_angle = None
-        proj_exit_velo    = None
+    proj_launch_angle = (proj_launch_angle / la_weight) if la_weight > 0 else None
+    proj_exit_velo    = (proj_exit_velo    / ev_weight) if ev_weight > 0 else None
+    proj_barrel_pct   = (proj_barrel_pct   / barrel_weight) if barrel_weight > 0 else None
+    proj_fb_pct       = (proj_fb_pct       / fb_weight) if fb_weight > 0 else None
+    proj_hard_hit     = (proj_hard_hit     / hh_weight) if hh_weight > 0 else None
 
     if total_weight > 0:
         proj_avg     /= total_weight
@@ -351,6 +383,57 @@ def project_hitter(m: dict, pitcher_profiles: dict, hitter_splits: dict,
     proj_hr_rate *= la_mult
     proj_slg     *= ev_slg_mult
 
+    # ── Phase-1: Batted-ball quality multipliers ────────────────────
+    # League averages below were measured empirically in our data to keep
+    # the neutral hitter mult=1.0 (see logs/splits_rebuild diagnostics).
+    # Barrel% (~0.06 in our data): strong direct HR signal. Clip ±25%.
+    barrel_mult = 1.0
+    if proj_barrel_pct is not None:
+        barrel_mult = max(0.85, min(1 + 2.5 * (proj_barrel_pct - 0.06), 1.30))
+    # FB% (~0.32): fly balls convert to HR much more than grounders.
+    fb_mult = 1.0
+    if proj_fb_pct is not None:
+        fb_mult = max(0.85, min(1 + 1.5 * (proj_fb_pct - 0.32), 1.18))
+    # Hard-hit% (~0.36): modest hit-rate bonus.
+    hh_mult = 1.0
+    if proj_hard_hit is not None:
+        hh_mult = max(0.94, min(1 + 0.8 * (proj_hard_hit - 0.36), 1.10))
+
+    proj_hr_rate *= barrel_mult * fb_mult
+    proj_slg     *= fb_mult * (1 + (barrel_mult - 1) * 0.5)
+    proj_avg     *= hh_mult
+
+    # ── Phase-1: Pitcher handedness HR/9 override ────────────────────
+    # Replace the flat platoon HR multiplier with actual pitcher HR/9
+    # against this hitter's handedness. Falls back silently if unknown.
+    pitcher_stats = (pitcher_season_stats or {}).get(pitcher_id, {})
+    # The hand-split HR/9 metric is computed as HR / (IP × PA-share). Because
+    # our IP estimate is starter-only but PAs include relievers, the metric's
+    # practical mean in our data is ~1.85 — not the literal MLB 1.20. Using
+    # the empirical mean keeps the ratio neutral at league-average pitchers.
+    LEAGUE_HR9 = 1.85
+    hand_hr9 = None
+    if hitter_hand == 'L':
+        hand_hr9 = pitcher_stats.get('hr9VsL')
+    elif hitter_hand == 'R':
+        hand_hr9 = pitcher_stats.get('hr9VsR')
+    elif hitter_hand == 'S':
+        # switch hitter — blend by pitcher hand (hits opposite side)
+        if pitcher_hand == 'R':
+            hand_hr9 = pitcher_stats.get('hr9VsL')
+        elif pitcher_hand == 'L':
+            hand_hr9 = pitcher_stats.get('hr9VsR')
+    if hand_hr9 is not None:
+        # Ratio to league HR/9, clipped. E.g. pitcher with 1.80 HR/9 vs RHH
+        # → 1.5× — multiplied into already-platoon-adjusted HR rate.
+        pitcher_hr_mult = max(0.70, min(hand_hr9 / LEAGUE_HR9, 1.40))
+        # Don't double-count the general platoon multiplier that already
+        # applied — roll it back so the effect is net-neutral on average.
+        # (platoon_mult sits in [0.95, 1.05]; undoing it restores neutral.)
+        if platoon_mult != 1.0:
+            proj_hr_rate *= (1.0 / platoon_mult)
+        proj_hr_rate *= pitcher_hr_mult
+
     # ── Park factors ────────────────────────────────────────────────
     pf = park_factors.get(venue_id, {})
     hr_factor        = pf.get('hrFactor',       1.0)
@@ -358,23 +441,37 @@ def project_hitter(m: dict, pitcher_profiles: dict, hitter_splits: dict,
     hard_hit_factor  = pf.get('hardHitFactor',  1.0)
     k_factor         = pf.get('kFactor',        1.0)
 
-    # Spray × park directional adjustment:
-    #   If hitter is a pull-heavy hitter and park's pull_deep zone is above average,
-    #   apply a small positive HR multiplier (and vice versa for oppo hitters).
+    # Distance-interacted spray × park HR multiplier.
+    # For each of LF/CF/RF, compute how much the park's fence distance
+    # differs from league mean, inverted (short wall → boost). Weight by
+    # the share of this hitter's fly balls going to that field.
+    #
+    # Formula: mult = Σ fb_field_pct × (league_mean / park_distance)^α
+    # where α ≈ 1.8 captures the nonlinear HR-rate/distance relationship
+    # (a 10% shorter wall → roughly 18% more HRs on FBs to that field).
     spray = (spray_profiles or {}).get(hitter_id, {})
+    LEAGUE_LF, LEAGUE_CF, LEAGUE_RF = 332.7, 404.6, 328.9
+    ALPHA = 1.8
     spray_park_mult = 1.0
-    if spray:
-        pull_pct   = spray.get('pullPct',  0.33)
-        oppo_pct   = spray.get('oppoPct',  0.33)
-        park_locs  = pf.get('hitLocations', {})
-        # pull_deep and oppo_deep are fractions of all BIP in the park
-        # League average deep pull ≈ 0.12–0.15; higher = park favors pull power
-        pull_deep  = park_locs.get('pull_deep',  0.13)
-        oppo_deep  = park_locs.get('oppo_deep',  0.10)
-        # Directional tendency score: pull-heavy hitter gets weighted toward pull_deep
-        directional_score = (pull_pct - 0.33) * (pull_deep - 0.13) * 20 + \
-                            (oppo_pct - 0.33) * (oppo_deep - 0.10) * 20
-        spray_park_mult = max(0.96, min(1 + directional_score * 0.02, 1.04))
+    fb_lf = spray.get('fbLfPct')
+    fb_cf = spray.get('fbCfPct')
+    fb_rf = spray.get('fbRfPct')
+    park_lf = pf.get('lfFt')
+    park_cf = pf.get('cfFt')
+    park_rf = pf.get('rfFt')
+    if (fb_lf is not None and park_lf and park_cf and park_rf):
+        # Normalize the three fractions defensively
+        total = (fb_lf or 0) + (fb_cf or 0) + (fb_rf or 0)
+        if total > 0.2:    # require enough signal
+            f_lf = (fb_lf or 0) / total
+            f_cf = (fb_cf or 0) / total
+            f_rf = (fb_rf or 0) / total
+            m_lf = (LEAGUE_LF / park_lf) ** ALPHA
+            m_cf = (LEAGUE_CF / park_cf) ** ALPHA
+            m_rf = (LEAGUE_RF / park_rf) ** ALPHA
+            raw = f_lf * m_lf + f_cf * m_cf + f_rf * m_rf
+            # Clip to a sane band so a single outlier doesn't 2× a projection
+            spray_park_mult = max(0.75, min(raw, 1.35))
 
     park_signal = (1 if hr_factor > 1.05 or hit_factor > 1.05
                    else -1 if hr_factor < 0.95 and hit_factor < 0.97
@@ -402,6 +499,14 @@ def project_hitter(m: dict, pitcher_profiles: dict, hitter_splits: dict,
     weather_signal = (1 if weather_mult > 1.05 else -1 if weather_mult < 0.95 else 0)
     proj_hr_rate *= weather_mult
     proj_hr_rate  = max(0, proj_hr_rate)
+
+    # Phase-4 calibration fix: cap per-PA HR rate at 8.5%. Prevents runaway
+    # multiplier stacking (barrel × fb × park × weather × pitcher) from
+    # producing absurd HR rates. League mean ~3%; elite-matchup ceiling ~8%.
+    # Historical peak single-season rate was ~7.5% (Bonds 2001). A single-
+    # game cap at 8.5% leaves room for genuinely exceptional matchups
+    # without letting compound multipliers sail past reality.
+    proj_hr_rate = min(proj_hr_rate, 0.085)
 
     # ── Matchup signal ───────────────────────────────────────────────
     matchup_signal = _matchup_signal(hitter_id, hitter_splits, arsenal)
@@ -891,7 +996,8 @@ def _load_hitter_splits(hitter_ids: list) -> dict:
                avg, slg, obp, ops,
                swing_pct, whiff_pct, hard_hit_pct,
                high_velo_whiff_pct, high_spin_whiff_pct,
-               avg_exit_velo, avg_launch_angle
+               avg_exit_velo, avg_launch_angle,
+               barrel_pct, fb_pct, ld_pct, gb_pct
         FROM hitter_pitch_splits
         WHERE hitter_id = ANY(:ids)
         ORDER BY hitter_id, pitch_family, season DESC
@@ -916,6 +1022,10 @@ def _load_hitter_splits(hitter_ids: list) -> dict:
             'highSpinWhiffPct': _fv(r['high_spin_whiff_pct']),
             'avgExitVelo':     _fv(r['avg_exit_velo']),
             'avgLaunchAngle':  _fv(r['avg_launch_angle']),
+            'barrelPct':       _fv(r['barrel_pct']),
+            'fbPct':           _fv(r['fb_pct']),
+            'ldPct':           _fv(r['ld_pct']),
+            'gbPct':           _fv(r['gb_pct']),
         }
     return out
 
@@ -945,15 +1055,43 @@ def _load_similar(hitter_ids: list) -> dict:
     return out
 
 
+def _load_pitcher_similar(pitcher_ids: list) -> dict:
+    """Top-N similar pitchers by movement/arsenal vector. Used to blend hitter
+    rates across archetype-similar pitchers when own head-to-head is thin."""
+    if not pitcher_ids:
+        return {}
+    df = _q(
+        """
+        SELECT pitcher_id, similar_list
+        FROM pitcher_similar
+        WHERE pitcher_id = ANY(:ids)
+        """,
+        pitcher_ids,
+    )
+    out: dict = {}
+    for _, r in df.iterrows():
+        sim_list = r['similar_list'] or []
+        mapped = [
+            {'pitcherId': int(s.get('pitcher_id') or s.get('pitcherId')),
+             'pitcherName': s.get('pitcher_name') or s.get('pitcherName', ''),
+             'similarity': float(s.get('similarity', 0.0))}
+            for s in sim_list
+        ]
+        out[int(r['pitcher_id'])] = mapped
+    return out
+
+
 def _load_park_factors(venue_ids: list) -> dict:
     if not venue_ids:
         return {}
     df = _q(
         """
-        SELECT venue_id, hr_factor, hit_factor, hard_hit_factor,
-               k_factor, bb_factor, sample_size, hit_locations
-        FROM park_factors
-        WHERE venue_id = ANY(:ids)
+        SELECT pf.venue_id, pf.hr_factor, pf.hit_factor, pf.hard_hit_factor,
+               pf.k_factor, pf.bb_factor, pf.sample_size, pf.hit_locations,
+               v.lf_ft, v.cf_ft, v.rf_ft
+        FROM park_factors pf
+        LEFT JOIN venues v ON v.venue_id = pf.venue_id
+        WHERE pf.venue_id = ANY(:ids)
         """,
         venue_ids,
     )
@@ -967,6 +1105,9 @@ def _load_park_factors(venue_ids: list) -> dict:
             'bbFactor':       float(r['bb_factor'] or 1.0),
             'sampleSize':     int(r['sample_size'] or 0),
             'hitLocations':   r['hit_locations'] or {},
+            'lfFt':           _fv(r['lf_ft']),
+            'cfFt':           _fv(r['cf_ft']),
+            'rfFt':           _fv(r['rf_ft']),
         }
         for _, r in df.iterrows()
     }
@@ -1016,7 +1157,8 @@ def _load_spray_profiles(hitter_ids: list) -> dict:
     df = _q(
         """
         SELECT hitter_id, pull_pct, center_pct, oppo_pct,
-               deep_pct, hr_pull_pct, avg_exit_velo, avg_launch_angle
+               deep_pct, hr_pull_pct, avg_exit_velo, avg_launch_angle,
+               fb_lf_pct, fb_cf_pct, fb_rf_pct
         FROM hitter_spray_profiles
         WHERE hitter_id = ANY(:ids)
         """,
@@ -1032,6 +1174,9 @@ def _load_spray_profiles(hitter_ids: list) -> dict:
             'hrPullPct':      float(r['hr_pull_pct'] or 0),
             'avgExitVelo':    _fv(r['avg_exit_velo']),
             'avgLaunchAngle': _fv(r['avg_launch_angle']),
+            'fbLfPct':        _fv(r['fb_lf_pct']),
+            'fbCfPct':        _fv(r['fb_cf_pct']),
+            'fbRfPct':        _fv(r['fb_rf_pct']),
         }
         for _, r in df.iterrows()
     }
@@ -1044,7 +1189,9 @@ def _load_pitcher_season_stats(pitcher_ids: list) -> dict:
         """
         SELECT DISTINCT ON (pitcher_id)
                pitcher_id, season, avg_ip, avg_k, avg_bb, avg_h, avg_hr,
-               fip, games_started
+               fip, games_started,
+               hr9_vs_l, hr9_vs_r, k_pct_vs_l, k_pct_vs_r,
+               fb_pct_allowed, barrel_pct_allowed
         FROM pitcher_season_stats
         WHERE pitcher_id = ANY(:ids)
         ORDER BY pitcher_id, season DESC
@@ -1062,6 +1209,12 @@ def _load_pitcher_season_stats(pitcher_ids: list) -> dict:
             'avgHR':        float(r['avg_hr'] or 0),
             'fip':          float(r['fip']) if r['fip'] is not None else None,
             'gamesStarted': int(r['games_started'] or 0),
+            'hr9VsL':       _fv(r['hr9_vs_l']),
+            'hr9VsR':       _fv(r['hr9_vs_r']),
+            'kPctVsL':      _fv(r['k_pct_vs_l']),
+            'kPctVsR':      _fv(r['k_pct_vs_r']),
+            'fbPctAllowed': _fv(r['fb_pct_allowed']),
+            'barrelPctAllowed': _fv(r['barrel_pct_allowed']),
         }
         for _, r in df.iterrows()
     }
@@ -1163,11 +1316,13 @@ def fetch_lineups(game_date: str) -> list[dict]:
 
     confirmed = [m for m in matchups if m['hitterId'] and m['pitcherId']]
 
-    # Games that already have a confirmed lineup — don't fall back for these
-    confirmed_game_pks = {m['gamePk'] for m in confirmed}
+    # Track per-(game, side) lineups, not per-game. If only one side has a
+    # confirmed lineup (common when a lineup drops on a staggered schedule),
+    # the other side still needs the previous-game fallback.
+    confirmed_game_sides = {(m['gamePk'], m['side']) for m in confirmed}
 
-    # For games with a probable pitcher but no confirmed lineup, use recent batting orders
-    needs_fallback = [c for c in fallback_candidates if c['gamePk'] not in confirmed_game_pks]
+    needs_fallback = [c for c in fallback_candidates
+                      if (c['gamePk'], c['side']) not in confirmed_game_sides]
 
     if needs_fallback:
         label = 'some games' if confirmed else 'all games'

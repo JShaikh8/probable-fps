@@ -133,6 +133,30 @@ def bulk_insert_ignore(session, model, rows: list[dict], pk_cols: list[str]):
         session.execute(stmt)
 
 
+# Phase-4: pitch-movement re-ingest must UPDATE existing rows on conflict, not
+# skip them. Use this instead of bulk_insert_ignore for the `pitches` table
+# whenever movement fields might need backfilling.
+PITCH_UPSERT_COLS = (
+    'pfx_x', 'pfx_z', 'x0', 'z0', 'extension', 'plate_time',
+    'start_speed', 'end_speed', 'spin_rate', 'spin_direction',
+)
+
+def bulk_upsert_pitches(session, rows: list[dict]):
+    """Insert pitches; on natural-key conflict update tracking columns."""
+    if not rows:
+        return
+    from db.models import Pitch
+    for i in range(0, len(rows), BATCH_SIZE):
+        chunk = rows[i:i + BATCH_SIZE]
+        stmt = pg_insert(Pitch.__table__).values(chunk)
+        set_ = {c: getattr(stmt.excluded, c) for c in PITCH_UPSERT_COLS}
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['game_pk', 'at_bat_index', 'pitch_index'],
+            set_=set_,
+        )
+        session.execute(stmt)
+
+
 def upsert_players(session, players: list[dict]):
     """Upsert player metadata (name, side/hand) seen in a game."""
     if not players:
@@ -185,10 +209,7 @@ def ingest_season(season: int, force: bool = False):
                     session, AtBat, at_bats,
                     pk_cols=['game_pk', 'at_bat_index'],
                 )
-                bulk_insert_ignore(
-                    session, Pitch, pitches,
-                    pk_cols=['game_pk', 'at_bat_index', 'pitch_index'],
-                )
+                bulk_upsert_pitches(session, pitches)
                 mark_log(session, gpk, 'done',
                          pitch_count=len(pitches), ab_count=len(at_bats))
                 session.commit()

@@ -18,7 +18,7 @@ import time
 from datetime import datetime
 
 import requests
-from sqlalchemy import BigInteger, Column, DateTime, Integer, text
+from sqlalchemy import text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from tqdm import tqdm
 
@@ -26,20 +26,7 @@ _here = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(_here, '..'))
 
 from config import DEFAULT_SEASONS, get_engine, get_session
-from db.models import Base
-
-
-# ── Schema for per-hitter per-game counts (runs, SB) ──────────────
-class HitterGameStats(Base):
-    __tablename__ = 'hitter_game_stats'
-    __table_args__ = {'extend_existing': True}
-    hitter_id = Column(Integer, primary_key=True)
-    game_pk = Column(BigInteger, primary_key=True)
-    runs = Column(Integer, default=0)
-    stolen_bases = Column(Integer, default=0)
-    caught_stealing = Column(Integer, default=0)
-    sac_flies = Column(Integer, default=0)
-    ingested_at = Column(DateTime, default=datetime.utcnow)
+from db.models import HitterGameStats
 
 
 BOXSCORE_URL = 'https://statsapi.mlb.com/api/v1/game/{game_pk}/boxscore'

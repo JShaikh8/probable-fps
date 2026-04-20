@@ -31,6 +31,10 @@ class Venue(Base):
     roof_type = Column(String(50), nullable=True)
     lat = Column(Float, nullable=True)
     lng = Column(Float, nullable=True)
+    # Outfield fence distances in feet (LF line, CF, RF line)
+    lf_ft = Column(Float, nullable=True)
+    cf_ft = Column(Float, nullable=True)
+    rf_ft = Column(Float, nullable=True)
 
 
 class Team(Base):
@@ -131,6 +135,13 @@ class Pitch(Base):
     spin_direction = Column(Float, nullable=True)
     px = Column(Float, nullable=True)
     pz = Column(Float, nullable=True)
+    # Phase-4: movement + release geometry (Statcast pitch tracking)
+    pfx_x = Column(Float, nullable=True)       # horizontal break (inches, pitcher-perspective)
+    pfx_z = Column(Float, nullable=True)       # vertical break (inches, gravity-adjusted — "IVB")
+    x0 = Column(Float, nullable=True)          # release side (feet, from center)
+    z0 = Column(Float, nullable=True)          # release height (feet, from ground)
+    extension = Column(Float, nullable=True)   # release distance in front of rubber (ft)
+    plate_time = Column(Float, nullable=True)  # release → plate (seconds)
     pitch_result = Column(String(50), nullable=True)
     zone = Column(Integer, nullable=True)
     strikes = Column(Integer, nullable=True)
@@ -168,6 +179,11 @@ class HitterPitchSplit(Base):
     hard_hit_pct = Column(Float, nullable=True)
     high_velo_whiff_pct = Column(Float, nullable=True)
     high_spin_whiff_pct = Column(Float, nullable=True)
+    # Phase-1 batted-ball quality additions
+    barrel_pct = Column(Float, nullable=True)     # EV ≥ 95 AND LA in [25, 35]
+    fb_pct = Column(Float, nullable=True)         # fly_ball / popup trajectory share
+    ld_pct = Column(Float, nullable=True)
+    gb_pct = Column(Float, nullable=True)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
@@ -193,6 +209,13 @@ class PitcherSeasonStats(Base):
     avg_hr = Column(Float, default=0.0)
     fip = Column(Float, default=0.0)
     games_started = Column(Integer, default=0)
+    # Phase-1 pitcher handedness splits + batted-ball quality allowed
+    hr9_vs_l = Column(Float, nullable=True)
+    hr9_vs_r = Column(Float, nullable=True)
+    k_pct_vs_l = Column(Float, nullable=True)
+    k_pct_vs_r = Column(Float, nullable=True)
+    fb_pct_allowed = Column(Float, nullable=True)
+    barrel_pct_allowed = Column(Float, nullable=True)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
@@ -232,6 +255,12 @@ class HitterSprayProfile(Base):
     avg_exit_velo = Column(Float, nullable=True)
     avg_launch_angle = Column(Float, nullable=True)
     hr_pull_pct = Column(Float, default=0.0)
+    # Fly-ball field distribution (by physical bearing angle from home plate).
+    # Used for distance-interacted park HR multiplier: short LF wall ×
+    # hitter-who-pulls-FBs-to-LF = real HR boost.
+    fb_lf_pct = Column(Float, nullable=True)
+    fb_cf_pct = Column(Float, nullable=True)
+    fb_rf_pct = Column(Float, nullable=True)
     updated_at = Column(DateTime, default=func.now(), onupdate=func.now())
 
 
@@ -402,3 +431,20 @@ class NrfiActual(Base):
     home_fi_runs = Column(Integer)
     away_fi_runs = Column(Integer)
     reconciled_at = Column(DateTime, default=func.now())
+
+
+class HitterGameStats(Base):
+    """Per-hitter per-game runs + stolen bases pulled from MLB boxscores.
+
+    Runs and SB don't appear in the /game/feed/live at-bat stream, so they need
+    a separate ingest pass. Each run = 2 DK pts, each SB = 5 DK pts — skipping
+    this left a systematic ~1.4-pt under-projection for active leadoff hitters.
+    """
+    __tablename__ = 'hitter_game_stats'
+    hitter_id = Column(Integer, primary_key=True)
+    game_pk = Column(BigInteger, primary_key=True)
+    runs = Column(Integer, default=0)
+    stolen_bases = Column(Integer, default=0)
+    caught_stealing = Column(Integer, default=0)
+    sac_flies = Column(Integer, default=0)
+    ingested_at = Column(DateTime, default=datetime.utcnow)

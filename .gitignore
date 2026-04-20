@@ -27,3 +27,4 @@ mlb-pipeline-data/
 
 # Trained ML models — retrained on every --retrain-ml cron run
 /artifacts/
+logs/

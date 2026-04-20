@@ -169,3 +169,71 @@ def probs_from_proj(proj: dict, expected_pa: float) -> dict[str, float]:
         'strikeout':    k_rate,
         'out':          out_rate,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Phase-1: Park + weather modifier applied to per-batter outcome probs
+# ═══════════════════════════════════════════════════════════════════
+
+WIND_BOOST_DIRS = {'out', 'out to cf', 'out to lf', 'out to rf',
+                   'out to left', 'out to right', 'out to center'}
+WIND_SUPPRESS   = {'in', 'in from cf', 'in from lf', 'in from rf',
+                   'in from left', 'in from right', 'in from center'}
+
+
+def env_multiplier(park: dict | None, weather: dict | None) -> tuple[float, float]:
+    """
+    Compute (hit_mult, hr_mult) from park factors + game-time weather.
+    Both multipliers are clipped; applied per-outcome inside apply_env_to_probs.
+    """
+    hit_mult = 1.0
+    hr_mult  = 1.0
+
+    if park:
+        hit_mult *= max(0.9, min(park.get('hrFactor', 1.0) * 0.5 + park.get('hitFactor', 1.0) * 0.5, 1.1))
+        hr_mult  *= max(0.75, min(park.get('hrFactor', 1.0), 1.25))
+
+    if weather:
+        temp = weather.get('tempF')
+        if isinstance(temp, (int, float)):
+            # Cold (<55°F) suppresses offense ~5-8%; warm (>85°F) +3%
+            if temp < 55:
+                hit_mult *= max(0.92, 1 - (55 - temp) * 0.006)
+                hr_mult  *= max(0.85, 1 - (55 - temp) * 0.010)
+            elif temp > 80:
+                hit_mult *= min(1.04, 1 + (temp - 80) * 0.003)
+                hr_mult  *= min(1.12, 1 + (temp - 80) * 0.006)
+        ws = weather.get('windSpeedMph')
+        wd = (weather.get('windDir') or '').lower()
+        if isinstance(ws, (int, float)) and ws > 0:
+            if wd in WIND_BOOST_DIRS:
+                hr_mult *= min(1.25, 1 + ws * 0.012)
+            elif wd in WIND_SUPPRESS:
+                hr_mult *= max(0.80, 1 - ws * 0.010)
+
+    return hit_mult, hr_mult
+
+
+def apply_env_to_probs(probs: dict[str, float],
+                       park: dict | None = None,
+                       weather: dict | None = None) -> dict[str, float]:
+    """
+    Rescale outcome probs for park + weather, keeping sum = 1.
+    HR mult applied to home_run; hit mult applied to 1B/2B/3B. Walks/Ks held.
+    """
+    if not park and not weather:
+        return probs
+    hit_mult, hr_mult = env_multiplier(park, weather)
+    out = dict(probs)
+    out['home_run'] = probs.get('home_run', 0.0) * hr_mult
+    for k in ('single', 'double', 'triple'):
+        out[k] = probs.get(k, 0.0) * hit_mult
+    # Rebalance so total sums to 1 — absorb deltas into 'out' outcome
+    defense_keys = ('walk', 'hit_by_pitch', 'strikeout', 'out')
+    off_sum = sum(out.get(k, 0.0) for k in ('single', 'double', 'triple', 'home_run'))
+    def_sum = sum(probs.get(k, 0.0) for k in defense_keys)
+    target_def = max(0.02, 1.0 - off_sum)
+    scale = target_def / def_sum if def_sum > 0 else 1.0
+    for k in defense_keys:
+        out[k] = probs.get(k, 0.0) * scale
+    return out

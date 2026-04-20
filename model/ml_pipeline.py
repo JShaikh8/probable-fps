@@ -189,6 +189,68 @@ def build_training_set() -> pd.DataFrame:
     ]:
         df[col] = df[col].fillna(default)
 
+    # ── Phase-2: hitter batted-ball quality (PA-weighted across pitch families) ──
+    # Uses current-season splits as proxy for "entering today" batted-ball profile.
+    # Good enough — barrel% doesn't move much mid-season. For strict point-in-time
+    # accuracy we'd carry splits history by date; leave that for a later refactor.
+    print('Joining hitter batted-ball quality…')
+    hitter_bb = pd.read_sql_query(
+        """
+        SELECT hitter_id, season,
+               SUM(pa * COALESCE(barrel_pct, 0))::float / NULLIF(SUM(CASE WHEN barrel_pct IS NOT NULL THEN pa END), 0) AS h_barrel_pct,
+               SUM(pa * COALESCE(fb_pct, 0))::float     / NULLIF(SUM(CASE WHEN fb_pct IS NOT NULL THEN pa END), 0)     AS h_fb_pct,
+               SUM(pa * COALESCE(hard_hit_pct, 0))::float / NULLIF(SUM(CASE WHEN hard_hit_pct IS NOT NULL THEN pa END), 0) AS h_hard_hit_pct
+        FROM hitter_pitch_splits
+        GROUP BY hitter_id, season
+        """,
+        engine,
+    )
+    df = df.merge(hitter_bb, on=['hitter_id', 'season'], how='left')
+    for col, default in [
+        ('h_barrel_pct', 0.06),
+        ('h_fb_pct', 0.32),
+        ('h_hard_hit_pct', 0.36),
+    ]:
+        df[col] = df[col].fillna(default)
+
+    # ── Phase-2: pitcher handedness splits + batted-ball allowed ──
+    # For each PA, look up pitcher's hand-split HR/9 and K% vs THIS hitter's side.
+    print('Joining pitcher handedness + batted-ball-allowed features…')
+    pss = pd.read_sql_query(
+        """
+        SELECT pitcher_id, season,
+               hr9_vs_l, hr9_vs_r, k_pct_vs_l, k_pct_vs_r,
+               fb_pct_allowed, barrel_pct_allowed
+        FROM pitcher_season_stats
+        """,
+        engine,
+    )
+    df = df.merge(pss, on=['pitcher_id', 'season'], how='left')
+    # Build matchup-specific columns: use vs_L when hitter is L, vs_R when R.
+    # Switch hitters (S) use vs-opposite of pitcher hand (they hit opposite).
+    def _pick(row, l_col, r_col):
+        hs = row.get('hitter_side')
+        ph = row.get('pitcher_hand')
+        if hs == 'L': return row.get(l_col)
+        if hs == 'R': return row.get(r_col)
+        if hs == 'S':
+            if ph == 'R': return row.get(l_col)
+            if ph == 'L': return row.get(r_col)
+        return None
+    df['p_hr9_matched']  = df.apply(lambda r: _pick(r, 'hr9_vs_l', 'hr9_vs_r'), axis=1)
+    df['p_kpct_matched'] = df.apply(lambda r: _pick(r, 'k_pct_vs_l', 'k_pct_vs_r'), axis=1)
+    df['p_fb_allowed']       = df['fb_pct_allowed']
+    df['p_barrel_allowed']   = df['barrel_pct_allowed']
+    for col, default in [
+        ('p_hr9_matched', 1.85),
+        ('p_kpct_matched', 0.22),
+        ('p_fb_allowed', 0.34),
+        ('p_barrel_allowed', 0.06),
+    ]:
+        df[col] = df[col].fillna(default)
+    df.drop(columns=['hr9_vs_l', 'hr9_vs_r', 'k_pct_vs_l', 'k_pct_vs_r',
+                     'fb_pct_allowed', 'barrel_pct_allowed'], inplace=True)
+
     print(f'  merged: {len(df):,} rows × {df.shape[1]} cols')
     return df
 
@@ -225,6 +287,10 @@ def train(df: pd.DataFrame):
         'temp_f', 'wind_speed_mph',
         'h_prior_avg', 'h_prior_slg', 'h_prior_hr_rate',
         'h_prior_k_rate', 'h_prior_bb_rate', 'h_prior_pa',
+        # Phase-2 features
+        'h_barrel_pct', 'h_fb_pct', 'h_hard_hit_pct',
+        'p_hr9_matched', 'p_kpct_matched',
+        'p_fb_allowed', 'p_barrel_allowed',
     ] if c in df.columns]
 
     def _prep(d):
@@ -337,7 +403,10 @@ def predict(game_date: str | None = None):
                pf.k_factor, g.weather,
                pss.fip AS pitcher_fip,
                hp.h_prior_avg, hp.h_prior_slg, hp.h_prior_hr_rate,
-               hp.h_prior_k_rate, hp.h_prior_bb_rate, hp.h_prior_pa
+               hp.h_prior_k_rate, hp.h_prior_bb_rate, hp.h_prior_pa,
+               hbb.h_barrel_pct, hbb.h_fb_pct, hbb.h_hard_hit_pct,
+               psh.hr9_vs_l, psh.hr9_vs_r, psh.k_pct_vs_l, psh.k_pct_vs_r,
+               psh.fb_pct_allowed, psh.barrel_pct_allowed
         FROM projections p
         JOIN games g ON g.game_pk = p.game_pk
         LEFT JOIN park_factors pf ON pf.venue_id = g.venue_id
@@ -347,6 +416,21 @@ def predict(game_date: str | None = None):
             WHERE ps.pitcher_id = p.pitcher_id
             ORDER BY ps.season DESC LIMIT 1
         ) pss ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT
+              SUM(pa * COALESCE(barrel_pct, 0))::float / NULLIF(SUM(CASE WHEN barrel_pct IS NOT NULL THEN pa END), 0) AS h_barrel_pct,
+              SUM(pa * COALESCE(fb_pct, 0))::float     / NULLIF(SUM(CASE WHEN fb_pct IS NOT NULL THEN pa END), 0)     AS h_fb_pct,
+              SUM(pa * COALESCE(hard_hit_pct, 0))::float / NULLIF(SUM(CASE WHEN hard_hit_pct IS NOT NULL THEN pa END), 0) AS h_hard_hit_pct
+            FROM hitter_pitch_splits
+            WHERE hitter_id = p.hitter_id AND season = g.season
+        ) hbb ON TRUE
+        LEFT JOIN LATERAL (
+            SELECT hr9_vs_l, hr9_vs_r, k_pct_vs_l, k_pct_vs_r,
+                   fb_pct_allowed, barrel_pct_allowed
+            FROM pitcher_season_stats
+            WHERE pitcher_id = p.pitcher_id
+            ORDER BY season DESC LIMIT 1
+        ) psh ON TRUE
         WHERE p.game_date = '{game_date}'
         """,
         engine,
@@ -397,6 +481,33 @@ def predict(game_date: str | None = None):
             ('h_prior_k_rate', 0.22),
             ('h_prior_bb_rate', 0.085),
             ('h_prior_pa', 300),
+            ('h_barrel_pct', 0.06),
+            ('h_fb_pct', 0.32),
+            ('h_hard_hit_pct', 0.36),
+        ]:
+            projections[col] = projections[col].fillna(default)
+
+        # Phase-2: pick matched pitcher hand-split columns based on hitter side
+        def _pick(row, l_col, r_col):
+            hs = row.get('hitter_hand')
+            ph = row.get('pitcher_hand')
+            if hs == 'L': return row.get(l_col)
+            if hs == 'R': return row.get(r_col)
+            if hs == 'S':
+                if ph == 'R': return row.get(l_col)
+                if ph == 'L': return row.get(r_col)
+            return None
+        projections['p_hr9_matched']  = projections.apply(
+            lambda r: _pick(r, 'hr9_vs_l', 'hr9_vs_r'), axis=1)
+        projections['p_kpct_matched'] = projections.apply(
+            lambda r: _pick(r, 'k_pct_vs_l', 'k_pct_vs_r'), axis=1)
+        projections['p_fb_allowed']     = projections.get('fb_pct_allowed')
+        projections['p_barrel_allowed'] = projections.get('barrel_pct_allowed')
+        for col, default in [
+            ('p_hr9_matched', 1.85),
+            ('p_kpct_matched', 0.22),
+            ('p_fb_allowed', 0.34),
+            ('p_barrel_allowed', 0.06),
         ]:
             projections[col] = projections[col].fillna(default)
         projections['bats_L'] = (projections['hitter_hand'] == 'L').astype(int)

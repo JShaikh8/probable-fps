@@ -125,6 +125,8 @@ def main():
                         help='Skip ingest + features + reconcile; just projections')
     parser.add_argument('--retrain-ml', action='store_true',
                         help='Retrain ML models from historical data')
+    parser.add_argument('--skip-export', action='store_true',
+                        help="Don't write UI JSON snapshots after projections")
     args = parser.parse_args()
 
     if args.date:
@@ -165,6 +167,20 @@ def main():
     step_projections(proj_date)
     step_nrfi(proj_date)
     step_ml(proj_date, retrain=args.retrain_ml)
+
+    # Step 10 — export JSON snapshots for the static Render UI. Idempotent;
+    # runs after every pipeline so the UI is always one `git push` away from
+    # being up to date. Skip with --skip-export if you only wanted DB writes.
+    if not args.skip_export:
+        _header('Step 10 · Export JSON snapshots for UI')
+        from scripts.export_for_ui import main as export_main
+        import sys as _sys
+        _saved_argv = _sys.argv
+        _sys.argv = ['export_for_ui', '--days', '7']
+        try:
+            export_main()
+        finally:
+            _sys.argv = _saved_argv
 
     elapsed = time.time() - t0
     print(f'\n✓ Pipeline complete in {elapsed:.1f}s\n')

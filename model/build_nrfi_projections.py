@@ -30,7 +30,7 @@ from config import get_engine, get_session
 from db.io import bulk_upsert
 from db.models import NrfiProjection
 from model.nrfi_simulator import (
-    simulate_first_inning, summarize, probs_from_proj,
+    simulate_first_inning, summarize, probs_from_proj, apply_env_to_probs,
 )
 
 
@@ -77,6 +77,25 @@ def run(game_date: str | None = None):
         """,
         engine,
     )
+
+    # Phase-1: load park factors so the simulator can dampen/boost outcomes.
+    park_df = pd.read_sql_query(
+        """
+        SELECT venue_id, hr_factor, hit_factor, hard_hit_factor, k_factor, bb_factor
+        FROM park_factors
+        """,
+        engine,
+    )
+    park_map = {
+        int(r['venue_id']): {
+            'hrFactor': float(r['hr_factor'] or 1.0),
+            'hitFactor': float(r['hit_factor'] or 1.0),
+            'hardHitFactor': float(r['hard_hit_factor'] or 1.0),
+            'kFactor': float(r['k_factor'] or 1.0),
+            'bbFactor': float(r['bb_factor'] or 1.0),
+        }
+        for _, r in park_df.iterrows()
+    } if not park_df.empty else {}
     pitcher_by_game_side = {
         (int(r['game_pk']), r['side']): r for _, r in pitchers.iterrows() if r['side']
     }
@@ -133,11 +152,17 @@ def run(game_date: str | None = None):
         home_adj = _pitcher_adjustment(_fget(away_pitcher, 'fip'))
         away_adj = _pitcher_adjustment(_fget(home_pitcher, 'fip'))
 
+        # Phase-1: weather + park environment modifier shared across both sides
+        env_weather = meta.get('weather') or {}
+        env_park    = park_map.get(meta.get('venue_id')) if meta.get('venue_id') else None
+
         home_dist = simulate_first_inning(
-            [_apply_adj(b['probs'], home_adj) for b in home_bats],
+            [apply_env_to_probs(_apply_adj(b['probs'], home_adj), env_park, env_weather)
+             for b in home_bats],
         )
         away_dist = simulate_first_inning(
-            [_apply_adj(b['probs'], away_adj) for b in away_bats],
+            [apply_env_to_probs(_apply_adj(b['probs'], away_adj), env_park, env_weather)
+             for b in away_bats],
         )
         home_s = summarize(home_dist)
         away_s = summarize(away_dist)

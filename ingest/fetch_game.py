@@ -145,6 +145,12 @@ def parse_game(feed: dict, game_meta: dict) -> tuple[dict, list[dict], list[dict
             count      = event.get('count', {})
             ptype_code = details.get('type', {}).get('code')
 
+            breaks = pitch_data.get('breaks') or {}
+            # MLB sometimes reports IVB under `breakVerticalInduced`; prefer
+            # the more widely available `pfxZ` when present.
+            pfx_z = pcoords.get('pfxZ')
+            if pfx_z is None:
+                pfx_z = breaks.get('breakVerticalInduced')
             pitches.append({
                 'game_pk':       game_pk,
                 'at_bat_index':  ab_index,
@@ -155,10 +161,17 @@ def parse_game(feed: dict, game_meta: dict) -> tuple[dict, list[dict], list[dict
                 'pitch_family':  PITCH_FAMILY.get(ptype_code or ''),
                 'start_speed':   pitch_data.get('startSpeed'),
                 'end_speed':     pitch_data.get('endSpeed'),
-                'spin_rate':     (pitch_data.get('breaks') or {}).get('spinRate'),
-                'spin_direction': (pitch_data.get('breaks') or {}).get('spinDirection'),
+                'spin_rate':     breaks.get('spinRate'),
+                'spin_direction': breaks.get('spinDirection'),
                 'px':            pcoords.get('pX'),
                 'pz':            pcoords.get('pZ'),
+                # Phase-4: movement + release geometry
+                'pfx_x':         _to_float(pcoords.get('pfxX')),
+                'pfx_z':         _to_float(pfx_z),
+                'x0':            _to_float(pcoords.get('x0')),
+                'z0':            _to_float(pcoords.get('z0')),
+                'extension':     _to_float(pitch_data.get('extension')),
+                'plate_time':    _to_float(pitch_data.get('plateTime')),
                 'pitch_result':  details.get('call', {}).get('code') or details.get('description'),
                 'zone':          pitch_data.get('zone'),
                 'balls':         count.get('balls', 0),

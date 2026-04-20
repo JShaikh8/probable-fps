@@ -18,6 +18,19 @@ WHIFF_CODES = {'S', 'W', 'T', 'L', 'M', 'O', 'Q', 'R'}
 
 HIT_EVENTS = {'single', 'double', 'triple', 'home_run'}
 
+# Trajectory classification — MLB's `trajectory` column values vary in
+# wording across seasons; these buckets are tolerant of both the modern
+# (`fly_ball`, `line_drive`) and legacy (`fliner_liner`) strings.
+FB_TRAJ = {'fly_ball', 'popup', 'pop_up'}
+LD_TRAJ = {'line_drive', 'fliner_liner', 'fliner'}
+GB_TRAJ = {'ground_ball', 'groundball'}
+
+# Barrel definition — conservative Statcast-adjacent threshold. Exit velo
+# 95+ mph AND launch angle 25-35° has ~60%+ career HR conversion rate.
+BARREL_MIN_EV = 95.0
+BARREL_LA_LO  = 25.0
+BARREL_LA_HI  = 35.0
+
 
 def run(seasons: list[int] | None = None):
     engine = get_engine()
@@ -30,6 +43,7 @@ def run(seasons: list[int] | None = None):
         f"""
         SELECT p.hitter_id, p.pitcher_id, p.pitch_type, p.pitch_family,
                p.pitch_result, p.start_speed, p.spin_rate, p.px, p.pz,
+               p.pfx_x, p.pfx_z, p.x0, p.z0, p.extension, p.plate_time,
                p.balls, p.strikes, p.pitch_index, p.at_bat_index, p.game_pk,
                p.season
         FROM pitches p
@@ -132,6 +146,25 @@ def _write_hitter_splits(session, pitches: pd.DataFrame, merged: pd.DataFrame):
         else:
             hard_hit = None
 
+        # ── Barrel% & trajectory mix (batted balls with EV+LA data) ──
+        has_ev = grp['exit_velocity'].notna()
+        has_la = grp['launch_angle'].notna()
+        bb_mask = has_ev & has_la
+        barrel_pct = None
+        if bb_mask.sum() >= 5:
+            sub = grp[bb_mask]
+            barrels = ((sub['exit_velocity'] >= BARREL_MIN_EV) &
+                       (sub['launch_angle'].between(BARREL_LA_LO, BARREL_LA_HI))).sum()
+            barrel_pct = float(barrels / len(sub))
+
+        traj = grp['trajectory'].dropna() if 'trajectory' in grp.columns else pd.Series([], dtype=object)
+        fb_pct = ld_pct = gb_pct = None
+        if len(traj) >= 5:
+            n = len(traj)
+            fb_pct = float(traj.isin(FB_TRAJ).sum() / n)
+            ld_pct = float(traj.isin(LD_TRAJ).sum() / n)
+            gb_pct = float(traj.isin(GB_TRAJ).sum() / n)
+
         ph_all = pitches[
             (pitches['hitter_id'] == hitter_id) &
             (pitches['pitch_family'] == pitch_family) &
@@ -166,6 +199,10 @@ def _write_hitter_splits(session, pitches: pd.DataFrame, merged: pd.DataFrame):
             'hard_hit_pct': round(hard_hit, 4) if hard_hit is not None else None,
             'high_velo_whiff_pct': high_velo_whiff,
             'high_spin_whiff_pct': high_spin_whiff,
+            'barrel_pct': round(barrel_pct, 4) if barrel_pct is not None else None,
+            'fb_pct':     round(fb_pct, 4) if fb_pct is not None else None,
+            'ld_pct':     round(ld_pct, 4) if ld_pct is not None else None,
+            'gb_pct':     round(gb_pct, 4) if gb_pct is not None else None,
         })
 
     bulk_upsert(session, HitterPitchSplit, records,
@@ -187,12 +224,24 @@ def _write_pitcher_profiles(session, pitches: pd.DataFrame, merged: pd.DataFrame
             n = len(sub)
             whiffs = int(sub['is_whiff'].sum())
             swings = int(sub['is_swing'].sum())
+
+            def _m(col, digits):
+                vals = sub[col].dropna()
+                return round(float(vals.mean()), digits) if len(vals) >= 5 else None
+
             arsenal[pf] = {
                 'count':    int(n),
                 'usagePct': round(n / total, 4),
-                'avgSpeed': round(float(sub['start_speed'].dropna().mean()), 1) if sub['start_speed'].notna().any() else None,
-                'avgSpin':  round(float(sub['spin_rate'].dropna().mean()), 0) if sub['spin_rate'].notna().any() else None,
+                'avgSpeed': _m('start_speed', 1),
+                'avgSpin':  _m('spin_rate', 0),
                 'whiffPct': round(float(whiffs / swings), 4) if swings else None,
+                # Phase-4: movement + release geometry averages
+                'avgPfxX':       _m('pfx_x', 2),
+                'avgPfxZ':       _m('pfx_z', 2),
+                'avgX0':         _m('x0', 2),
+                'avgZ0':         _m('z0', 2),
+                'avgExtension':  _m('extension', 2),
+                'avgPlateTime':  _m('plate_time', 3),
             }
 
         ab_sub = merged[(merged['pitcher_id'] == pitcher_id) & (merged['season'] == season)]

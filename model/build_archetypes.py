@@ -30,7 +30,11 @@ HITTER_FEATURES = [
     'avg_exit_velo', 'avg_launch_angle',
 ]
 
-PITCHER_FEATURES = ['usagePct', 'avgSpeed', 'avgSpin', 'whiffPct']
+PITCHER_FEATURES = [
+    'usagePct', 'avgSpeed', 'avgSpin', 'whiffPct',
+    # Phase-4 additions — movement profile + release geometry
+    'avgPfxX', 'avgPfxZ', 'avgX0', 'avgZ0', 'avgExtension', 'avgPlateTime',
+]
 
 MIN_PA_PER_FAMILY = 10
 MIN_FAMILIES = 3
@@ -191,6 +195,12 @@ def run():
                 'avgSpeed':      info.get('avgSpeed'),
                 'avgSpin':       info.get('avgSpin'),
                 'whiffPct':      info.get('whiffPct'),
+                'avgPfxX':       info.get('avgPfxX'),
+                'avgPfxZ':       info.get('avgPfxZ'),
+                'avgX0':         info.get('avgX0'),
+                'avgZ0':         info.get('avgZ0'),
+                'avgExtension':  info.get('avgExtension'),
+                'avgPlateTime':  info.get('avgPlateTime'),
             })
 
     parsed = pd.DataFrame(rows)
